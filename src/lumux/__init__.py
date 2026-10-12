@@ -5,27 +5,45 @@ Public API:
     AppContext — dependency injection container
     HueBridge — bridge discovery and connection
     BridgeClient — Hue v2 REST API client
-    ScreenCapture — screen capture via PipeWire portal
+    ScreenCapture — screen capture via PipeWire portal, X11 or gamescope
     ZoneProcessor — ambilight zone processing
     SyncController — main sync loop controller
     ModeManager — Video/Reading mode switching
     EntertainmentStream — DTLS streaming to Hue Entertainment
     ReadingModeController — Reading mode static lighting
     BlackBarDetector — letterbox/pillarbox detection
+
+The classes are imported lazily: ``import lumux`` (or the headless
+``lumux.daemon``) must not drag in GStreamer, numpy or GTK until they are
+actually used.
 """
+
+import importlib
 
 __version__ = "0.7.1"
 __author__ = "Engin Kırmacı"
 
-# Re-export commonly used classes for convenience
-from lumux.app_context import AppContext
-from lumux.hue_bridge import HueBridge
-from lumux.bridge_client import BridgeClient
-from lumux.capture import ScreenCapture
-from lumux.zones import ZoneProcessor
-from lumux.sync import SyncController
-from lumux.mode_manager import ModeManager
-from lumux.entertainment import EntertainmentStream
-from lumux.reading_mode import ReadingModeController
-from lumux.black_bar_detector import BlackBarDetector
-from lumux.colors import ColorAnalyzer
+_EXPORTS = {
+    "AppContext": "lumux.app_context",
+    "HueBridge": "lumux.hue_bridge",
+    "BridgeClient": "lumux.bridge_client",
+    "ScreenCapture": "lumux.capture",
+    "ZoneProcessor": "lumux.zones",
+    "SyncController": "lumux.sync",
+    "ModeManager": "lumux.mode_manager",
+    "EntertainmentStream": "lumux.entertainment",
+    "ReadingModeController": "lumux.reading_mode",
+    "BlackBarDetector": "lumux.black_bar_detector",
+    "ColorAnalyzer": "lumux.colors",
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module 'lumux' has no attribute {name!r}")
+    value = getattr(importlib.import_module(module), name)
+    globals()[name] = value
+    return value

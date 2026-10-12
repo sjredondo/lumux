@@ -3,7 +3,6 @@
 from typing import Dict, Tuple, Optional
 
 from lumux.utils.rgb_xy_converter import rgb_to_xy
-import numpy as np
 
 
 class ColorAnalyzer:

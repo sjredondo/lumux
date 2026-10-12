@@ -43,6 +43,7 @@ dev = [
 
 [project.scripts]
 lumux = "lumux.__main__:main"
+lumux-daemon = "lumux.daemon:main"
 
 [project.urls]
 Homepage = "https://github.com/enginkirmaci/lumux"

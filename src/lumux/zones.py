@@ -1,7 +1,15 @@
 """Zone processing for screen division."""
 
-import numpy as np
+from __future__ import annotations
+
 from typing import Dict, Optional, TYPE_CHECKING
+
+try:
+    import numpy as np
+except ImportError:  # headless daemon on a minimal Python: see frame.py
+    np = None
+
+from lumux.frame import RawFrame
 
 if TYPE_CHECKING:
     from lumux.config.settings_manager import ZoneSettings
@@ -26,12 +34,42 @@ class ZoneProcessor:
         """Process image and return zone colors.
 
         Args:
-            image: numpy array (H, W, 3), dtype uint8
+            image: numpy array (H, W, 3), dtype uint8, or a RawFrame
 
         Returns:
             Dictionary mapping zone IDs to RGB tuples
         """
+        if isinstance(image, RawFrame):
+            return self._process_ambilight_raw(image)
         return self._process_ambilight(image)
+
+    def _edge_layout(self, width: int, height: int):
+        """Yield (zone_id, x1, y1, x2, y2) for every edge zone."""
+        edge_width = max(min(width // self.cols, height // 8), 5)
+        top_w = width // self.cols
+        side_h = height // self.rows
+        for i in range(self.cols):
+            x1, x2 = i * top_w, min((i + 1) * top_w, width)
+            yield f"top_{i}", x1, 0, x2, edge_width
+        for i in range(self.cols):
+            x1, x2 = i * top_w, min((i + 1) * top_w, width)
+            yield f"bottom_{i}", x1, max(0, height - edge_width), x2, height
+        for i in range(self.rows):
+            y1, y2 = i * side_h, min((i + 1) * side_h, height)
+            yield f"left_{i}", 0, y1, edge_width, y2
+        for i in range(self.rows):
+            y1, y2 = i * side_h, min((i + 1) * side_h, height)
+            yield f"right_{i}", max(0, width - edge_width), y1, width, y2
+
+    def _process_ambilight_raw(self, frame: RawFrame) -> Dict[str, tuple[int, int, int]]:
+        """Same zones as _process_ambilight, in plain Python. Meant for the
+        tiny frames GStreamer produces when numpy isn't installed."""
+        if frame.width < 2 or frame.height < 2:
+            return {}
+        return {
+            zone_id: frame.mean(x1, y1, x2, y2)
+            for zone_id, x1, y1, x2, y2 in self._edge_layout(frame.width, frame.height)
+        }
 
     def _process_ambilight(
         self, img_array: np.ndarray
