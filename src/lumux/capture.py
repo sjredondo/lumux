@@ -27,7 +27,7 @@ import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
 gi.require_version("GstVideo", "1.0")
-from gi.repository import GLib, Gst, GstApp, GstVideo
+from gi.repository import Gio, GLib, Gst, GstApp, GstVideo
 
 from lumux.black_bar_detector import BlackBarDetector, CropRegion
 
@@ -66,6 +66,12 @@ class ScreenCapture:
         self._portal_node_id: Optional[int] = None
         self._portal_session_handle: Optional[str] = None
         self._portal_bus = None
+        # PipeWire connection handed out by the portal (OpenPipeWireRemote).
+        # Sandboxed (Flatpak) apps can only see the granted screen-cast node
+        # through this fd, not through the plain PipeWire socket.
+        self._pipewire_fd: Optional[int] = None
+        self._pipeline_started_at = 0.0
+        self._no_frames_reported = False
         self._portal_cancel = threading.Event()
         self._portal_retry_at = 0.0
         self._portal_unsupported = False
@@ -238,15 +244,37 @@ class ScreenCapture:
         while self._pipeline_running and time.monotonic() < deadline:
             self._drain_bus()
             if self._pull_sample(0.1) or self._latest_frame is not None:
+                self._no_frames_reported = False
                 return self._process_image(self._latest_frame)
+
+        if (
+            self._pipeline_running
+            and self._latest_frame is None
+            and time.monotonic() - self._pipeline_started_at > 5.0
+        ):
+            # Used to fail silently: lights stayed dark with no explanation
+            self.last_error = (
+                "Screen capture started but no frames are arriving "
+                f"({self._active_backend} backend)"
+            )
+            if not self._no_frames_reported:
+                self._no_frames_reported = True
+                print(f"[capture] {self.last_error}")
+                self._log_pipeline_details()
         return None
 
     def _ensure_source(self) -> bool:
         """Make sure we have something to capture from."""
         backend = self._choose_backend()
         if backend == "x11":
+            if not os.environ.get("DISPLAY"):
+                self.last_error = (
+                    "X11 capture needs an X11 session; this is Wayland, so set "
+                    "Capture Method to Automatic"
+                )
+                return False
             if not self._x11_available():
-                self.last_error = "X11 capture unavailable (no DISPLAY or ximagesrc)"
+                self.last_error = "X11 capture unavailable: GStreamer ximagesrc plugin missing"
                 return False
             self._active_backend = "x11"
             return True
@@ -470,8 +498,12 @@ class ScreenCapture:
                 return False
 
             self._portal_node_id = streams[0][0]
+            self._pipewire_fd = self._open_pipewire_remote(bus, session_handle)
             self.last_error = ""
-            print(f"Portal session started. PipeWire node: {self._portal_node_id}")
+            print(
+                f"Portal session started. PipeWire node: {self._portal_node_id}"
+                + (f", remote fd {self._pipewire_fd}" if self._pipewire_fd is not None else "")
+            )
             new_token = results.get("restore_token") or ""
             if not new_token:
                 print(
@@ -492,6 +524,29 @@ class ScreenCapture:
         self._close_portal_session()
         return False
 
+    @staticmethod
+    def _open_pipewire_remote(bus, session_handle: str) -> Optional[int]:
+        """ScreenCast.OpenPipeWireRemote: returns a PipeWire socket fd that
+        can see the granted stream. pydbus can't receive fds, so use Gio."""
+        try:
+            result, fd_list = bus.con.call_with_unix_fd_list_sync(
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.ScreenCast",
+                "OpenPipeWireRemote",
+                GLib.Variant("(oa{sv})", (session_handle, {})),
+                GLib.VariantType.new("(h)"),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+                None,
+            )
+            (index,) = result.unpack()
+            return fd_list.get(index)
+        except Exception as e:
+            print(f"[capture] OpenPipeWireRemote failed, using default PipeWire socket: {e}")
+            return None
+
     def _close_portal_session(self):
         if self._portal_session_handle and self._portal_bus:
             try:
@@ -505,6 +560,12 @@ class ScreenCapture:
                 print(f"Error closing portal session (may already be closed): {e}")
         self._portal_session_handle = None
         self._portal_bus = None
+        if self._pipewire_fd is not None:
+            try:
+                os.close(self._pipewire_fd)
+            except OSError:
+                pass
+            self._pipewire_fd = None
 
     # ------------------------------------------------------------------
     # GStreamer pipeline
@@ -518,7 +579,9 @@ class ScreenCapture:
                 f"video/x-raw,framerate={fps}/1"
             )
         if self._portal_node_id:
-            return f"pipewiresrc path={self._portal_node_id} do-timestamp=true"
+            # pipewiresrc dups the fd, so it stays valid across pipeline restarts
+            fd = f"fd={self._pipewire_fd} " if self._pipewire_fd is not None else ""
+            return f"pipewiresrc {fd}path={self._portal_node_id} do-timestamp=true"
         return None
 
     def _get_pipeline_configs(self, src: str) -> List[str]:
@@ -659,6 +722,7 @@ class ScreenCapture:
                 self._scaled_h = target_h
 
                 self._pipeline_running = True
+                self._pipeline_started_at = time.monotonic()
                 self._pipeline_error_logged = False
                 self._active_config_key = config_key
                 scale_info = (
