@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lumux"
-version = "0.7.1"
+version = "0.8.0"
 description = "Philips Hue Sync application for Linux on Wayland"
 readme = "README.md"
 license = {text = "MIT"}
@@ -43,6 +43,7 @@ dev = [
 
 [project.scripts]
 lumux = "lumux.__main__:main"
+lumux-daemon = "lumux.daemon:main"
 
 [project.urls]
 Homepage = "https://github.com/enginkirmaci/lumux"

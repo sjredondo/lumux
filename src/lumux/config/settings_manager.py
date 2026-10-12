@@ -31,9 +31,12 @@ class CaptureSettings:
     scale_factor: float = 0.125
     source_type: str = "screen"  # "screen" = monitor, "window" = single window
     restore_token: str = ""  # Portal restore token for persistent screen-cast consent
-    # "auto" = X11 grab on X11 sessions (e.g. SteamOS Desktop Mode), portal on
-    # Wayland; "portal" / "x11" force one backend.
+    # "auto" = gamescope node in a gamescope session (SteamOS Game Mode), X11
+    # grab on X11 sessions (e.g. SteamOS Desktop Mode), portal on Wayland;
+    # "portal" / "x11" / "gamescope" force one backend.
     backend: str = "auto"
+    # PipeWire node for the gamescope backend: node.name, object.serial or id
+    pipewire_node: str = "gamescope"
 
 
 @dataclass
@@ -108,6 +111,11 @@ class SettingsManager:
 
     def _get_config_dir(self) -> Path:
         """Get the config directory, respecting XDG dirs for Flatpak compatibility."""
+        override = os.environ.get("LUMUX_CONFIG_DIR")
+        if override:
+            # Lets the headless daemon (and tests) point at a specific
+            # settings.json, e.g. the Flatpak's from outside the sandbox.
+            return Path(override)
         if is_running_in_flatpak():
             # In Flatpak, use XDG_CONFIG_HOME which is mapped to a persistent location
             # Usually: ~/.var/app/io.github.enginkirmaci.lumux/config/
@@ -232,8 +240,12 @@ class SettingsManager:
         )
         if self._settings.capture.source_type not in ("screen", "window"):
             self._settings.capture.source_type = "screen"
-        if self._settings.capture.backend not in ("auto", "portal", "x11"):
+        if self._settings.capture.backend not in ("auto", "portal", "x11", "gamescope"):
             self._settings.capture.backend = "auto"
+        if not isinstance(self._settings.capture.pipewire_node, str) or not (
+            self._settings.capture.pipewire_node.strip()
+        ):
+            self._settings.capture.pipewire_node = "gamescope"
         self._settings.sync.fps = max(1, min(60, self._settings.sync.fps))
         self._settings.sync.transition_time_ms = max(
             0, min(1000, self._settings.sync.transition_time_ms)

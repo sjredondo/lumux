@@ -10,7 +10,8 @@
     "scale_factor": 0.125,
     "source_type": "screen",
     "restore_token": "",
-    "backend": "auto"
+    "backend": "auto",
+    "pipewire_node": "gamescope"
   },
   "zones": {
     "show_preview": true,

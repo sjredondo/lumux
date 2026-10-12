@@ -7,6 +7,10 @@ Backends:
 * **x11** - ximagesrc. Needed on X11 sessions such as SteamOS Desktop Mode,
   where the KDE portal does not offer ScreenCast at all, so the portal path
   never produced a single frame.
+* **gamescope** - pipewiresrc pointed straight at the PipeWire video node that
+  gamescope (SteamOS Game Mode) publishes, normally named ``gamescope``. No
+  portal and no consent dialog are involved. The node can be set by name,
+  ``object.serial`` or id, and :func:`list_video_nodes` lists candidates.
 
 Frames are *pulled* from the appsink by the sync thread at the sync rate
 rather than pushed through a Python callback on every compositor frame
@@ -20,7 +24,10 @@ import threading
 import time
 from typing import Optional, List, Set, TYPE_CHECKING
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # minimal host Python (e.g. the headless daemon)
+    np = None
 
 import gi
 
@@ -30,6 +37,7 @@ gi.require_version("GstVideo", "1.0")
 from gi.repository import Gio, GLib, Gst, GstApp, GstVideo
 
 from lumux.black_bar_detector import BlackBarDetector, CropRegion
+from lumux.frame import RawFrame
 
 if TYPE_CHECKING:
     from lumux.config.settings_manager import BlackBarSettings
@@ -37,6 +45,70 @@ if TYPE_CHECKING:
 Gst.init(None)
 
 _request_counter = itertools.count(1)
+
+BACKENDS = ("auto", "portal", "x11", "gamescope")
+DEFAULT_GAMESCOPE_NODE = "gamescope"
+
+
+def is_gamescope_session() -> bool:
+    """True inside a gamescope session such as SteamOS Game Mode."""
+    if os.environ.get("GAMESCOPE_WAYLAND_DISPLAY"):
+        return True
+    return os.environ.get("XDG_CURRENT_DESKTOP", "").lower() == "gamescope"
+
+
+def list_video_nodes(timeout_s: float = 2.0) -> List[dict]:
+    """List PipeWire video source nodes visible to this process.
+
+    Used to find gamescope's node when it isn't called ``gamescope``. Returns
+    dicts with ``name``, ``serial``, ``id``, ``description`` and ``media_class``
+    (missing values are empty strings). Empty if the pipewire GStreamer
+    plugin is missing or PipeWire isn't reachable.
+    """
+    if Gst.DeviceProviderFactory.find("pipewiredeviceprovider") is None:
+        return []
+    monitor = Gst.DeviceMonitor.new()
+    monitor.add_filter("Video/Source", None)
+    nodes = []
+    try:
+        if not monitor.start():
+            return []
+        # The provider fills its device list asynchronously after start()
+        deadline = time.monotonic() + timeout_s
+        devices = monitor.get_devices() or []
+        while not devices and time.monotonic() < deadline:
+            time.sleep(0.1)
+            devices = monitor.get_devices() or []
+        for device in devices:
+            props = device.get_properties()
+
+            def prop(key):
+                if props is None or not props.has_field(key):
+                    return ""
+                return str(props.get_value(key))
+
+            nodes.append({
+                "name": prop("node.name"),
+                "serial": prop("object.serial"),
+                "id": prop("object.id"),
+                "description": prop("node.description") or device.get_display_name(),
+                "media_class": prop("media.class") or device.get_device_class(),
+            })
+    finally:
+        monitor.stop()
+    return nodes
+
+
+def find_gamescope_node(nodes: List[dict]) -> Optional[dict]:
+    """Pick gamescope's node from :func:`list_video_nodes` output."""
+    for node in nodes:
+        if node.get("name") == DEFAULT_GAMESCOPE_NODE:
+            return node
+    for node in nodes:
+        text = f"{node.get('name', '')} {node.get('description', '')}".lower()
+        if "gamescope" in text:
+            return node
+    return None
 
 
 class _PortalCancelled(Exception):
@@ -56,11 +128,14 @@ class ScreenCapture:
         restore_token: str = "",
         backend: str = "auto",
         max_fps: int = 30,
+        pipewire_node: str = DEFAULT_GAMESCOPE_NODE,
     ):
         self.scale_factor = scale_factor
         self.source_type = source_type
         self.backend = backend
         self.max_fps = max_fps
+        # gamescope backend: node name, object.serial or numeric id
+        self.pipewire_node = pipewire_node or DEFAULT_GAMESCOPE_NODE
         self.last_error: str = ""
 
         self._portal_node_id: Optional[int] = None
@@ -87,7 +162,7 @@ class ScreenCapture:
 
         self._pipeline: Optional[Gst.Pipeline] = None
         self._appsink: Optional[GstApp.AppSink] = None
-        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame = None  # np.ndarray, or RawFrame without numpy
         self._frame_seq = 0
         self._pipeline_running = False
         self._pipeline_error_logged = False
@@ -101,7 +176,7 @@ class ScreenCapture:
         self._needs_pipeline_restart = False
 
         self._black_bar_detector: Optional[BlackBarDetector] = None
-        if black_bar_settings is not None:
+        if black_bar_settings is not None and np is not None:
             self._init_black_bar_detector(black_bar_settings)
 
     # ------------------------------------------------------------------
@@ -162,6 +237,13 @@ class ScreenCapture:
         if changed and self._pipeline_running:
             self._needs_pipeline_restart = True
 
+    def update_pipewire_node(self, node: str) -> None:
+        node = node or DEFAULT_GAMESCOPE_NODE
+        changed = node != self.pipewire_node
+        self.pipewire_node = node
+        if changed and self._active_backend == "gamescope" and self._pipeline_running:
+            self._needs_pipeline_restart = True
+
     def _init_black_bar_detector(self, settings: "BlackBarSettings") -> None:
         self._black_bar_detector = BlackBarDetector(
             enabled=settings.enabled,
@@ -171,6 +253,8 @@ class ScreenCapture:
         )
 
     def update_black_bar_settings(self, settings: "BlackBarSettings") -> None:
+        if np is None:
+            return  # detection needs numpy
         if self._black_bar_detector is None:
             self._init_black_bar_detector(settings)
         else:
@@ -202,9 +286,15 @@ class ScreenCapture:
             Gst.ElementFactory.find("ximagesrc") is not None
         )
 
+    @staticmethod
+    def _pipewiresrc_available() -> bool:
+        return Gst.ElementFactory.find("pipewiresrc") is not None
+
     def _choose_backend(self) -> str:
-        if self.backend in ("portal", "x11"):
+        if self.backend in ("portal", "x11", "gamescope"):
             return self.backend
+        if is_gamescope_session():
+            return "gamescope"
         if (self._is_x11_session() or self._portal_unsupported) and self._x11_available():
             return "x11"
         return "portal"
@@ -221,7 +311,9 @@ class ScreenCapture:
             return False
         return self._pull_sample(0)
 
-    def capture(self) -> Optional[np.ndarray]:
+    def capture(self):
+        """Newest frame as an (H, W, 3) uint8 array (a RawFrame without
+        numpy), or None."""
         if self._needs_pipeline_restart and self._pipeline_running:
             self._restart_pipeline()
             if not self._pipeline_running:
@@ -266,6 +358,15 @@ class ScreenCapture:
     def _ensure_source(self) -> bool:
         """Make sure we have something to capture from."""
         backend = self._choose_backend()
+        if backend == "gamescope":
+            if not self._pipewiresrc_available():
+                self.last_error = (
+                    "gamescope capture needs the GStreamer pipewire plugin "
+                    "(pipewiresrc)"
+                )
+                return False
+            self._active_backend = "gamescope"
+            return True
         if backend == "x11":
             if not os.environ.get("DISPLAY"):
                 self.last_error = (
@@ -318,8 +419,11 @@ class ScreenCapture:
         self._frame_seq += 1
         return True
 
-    def _process_image(self, screen: np.ndarray) -> np.ndarray:
+    def _process_image(self, screen):
         if screen is None or screen.size == 0:
+            return screen
+        if isinstance(screen, RawFrame):
+            # No numpy: no black-bar detection; the pipeline already scaled
             return screen
 
         if self._black_bar_detector is not None:
@@ -340,7 +444,10 @@ class ScreenCapture:
             return screen
 
         if not self._pipeline_scaled and self.scale_factor < 1.0:
-            import PIL.Image as Image
+            try:
+                import PIL.Image as Image
+            except ImportError:
+                return screen  # zones still work on the full frame
 
             new_h = max(1, int(screen.shape[0] * self.scale_factor))
             new_w = max(1, int(screen.shape[1] * self.scale_factor))
@@ -578,11 +685,28 @@ class ScreenCapture:
                 "ximagesrc use-damage=false show-pointer=false ! "
                 f"video/x-raw,framerate={fps}/1"
             )
+        if self._active_backend == "gamescope":
+            return self._gamescope_source()
         if self._portal_node_id:
             # pipewiresrc dups the fd, so it stays valid across pipeline restarts
             fd = f"fd={self._pipewire_fd} " if self._pipewire_fd is not None else ""
             return f"pipewiresrc {fd}path={self._portal_node_id} do-timestamp=true"
         return None
+
+    def _gamescope_source(self) -> str:
+        node = str(self.pipewire_node or DEFAULT_GAMESCOPE_NODE)
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", node):
+            # Goes into a parse_launch string; refuse anything that could
+            # inject extra pipeline syntax.
+            node = DEFAULT_GAMESCOPE_NODE
+        # target-object (PipeWire >= 0.3.64) takes a node name or serial;
+        # older pipewiresrc only has path=<id>.
+        probe = Gst.ElementFactory.make("pipewiresrc", None)
+        if node.isdigit() and (
+            probe is None or probe.find_property("target-object") is None
+        ):
+            return f"pipewiresrc path={node} do-timestamp=true"
+        return f"pipewiresrc target-object={node} do-timestamp=true"
 
     def _get_pipeline_configs(self, src: str) -> List[str]:
         configs = []
@@ -600,6 +724,28 @@ class ScreenCapture:
         # No signals: the sync thread pulls the newest frame itself
         sink_props = "name=sink emit-signals=false drop=true max-buffers=1 sync=false"
         use_gl = self._active_backend != "x11"  # X11 frames are already in RAM
+
+        if self._active_backend == "gamescope":
+            # gamescope only offers its full output size (its own scaler is
+            # driven by a gamescope-specific SPA property GStreamer can't
+            # set). The first frame tells us that size; then videoscale
+            # shrinks every frame *before* colour conversion, so a 1280x800
+            # Deck screen becomes 160x100 RGB at the default scale factor.
+            if target_w and target_h and has_videoscale and has_videoconvert:
+                small = f"video/x-raw,width={target_w},height={target_h}"
+                configs.append(
+                    f"{src} ! videoscale ! {small} ! videoconvert ! "
+                    f"video/x-raw,format=RGB ! appsink {sink_props}"
+                )
+                configs.append(
+                    f"{src} ! videoconvert ! videoscale ! {small},format=RGB ! "
+                    f"appsink {sink_props}"
+                )
+            if has_videoconvert:
+                configs.append(
+                    f"{src} ! videoconvert ! video/x-raw,format=RGB ! appsink {sink_props}"
+                )
+            return configs
 
         if target_w and target_h:
             scaled_caps = f"video/x-raw,format=RGB,width={target_w},height={target_h}"
@@ -671,6 +817,7 @@ class ScreenCapture:
         """Identify a pipeline config independent of node id and dimensions,
         so runtime failures can be remembered across restarts."""
         key = re.sub(r"path=\d+", "path=*", pipeline_str)
+        key = re.sub(r"target-object=\S+", "target-object=*", key)
         key = re.sub(r"width=\d+", "width=*", key)
         key = re.sub(r"height=\d+", "height=*", key)
         key = re.sub(r"framerate=\d+/1", "framerate=*", key)
@@ -802,7 +949,12 @@ class ScreenCapture:
 
     def _log_pipeline_details(self):
         try:
-            print(f"Capture backend: {self._active_backend}, PipeWire node: {self._portal_node_id}")
+            node = (
+                self.pipewire_node
+                if self._active_backend == "gamescope"
+                else self._portal_node_id
+            )
+            print(f"Capture backend: {self._active_backend}, PipeWire node: {node}")
             plugins = {
                 name: Gst.ElementFactory.find(name) is not None
                 for name in (
@@ -827,7 +979,7 @@ class ScreenCapture:
     @staticmethod
     def _extract_pixel_rows(
         data, width: int, height: int, bpp: int, stride: Optional[int]
-    ) -> np.ndarray:
+    ):
         """Return a (height, width*bpp) uint8 array, stripping row padding.
 
         GStreamer may pad each row to an alignment boundary (e.g. 4 bytes),
@@ -856,7 +1008,28 @@ class ScreenCapture:
             arr, shape=(height, row_bytes), strides=(stride, 1)
         )
 
-    def _sample_to_frame(self, sample) -> Optional[np.ndarray]:
+    @staticmethod
+    def _raw_rgb_frame(data, width: int, height: int, stride: Optional[int]) -> RawFrame:
+        """Packed RGB copy of the mapped buffer, for when numpy is missing."""
+        row_bytes = width * 3
+        data = bytes(data)
+        if not stride or stride < row_bytes:
+            stride = row_bytes if len(data) == height * row_bytes else (
+                len(data) // height if height else row_bytes
+            )
+        if stride < row_bytes or len(data) < stride * (height - 1) + row_bytes:
+            raise ValueError(
+                f"Buffer too small: {len(data)} bytes for {width}x{height} RGB"
+            )
+        if stride != row_bytes:
+            data = b"".join(
+                data[y * stride : y * stride + row_bytes] for y in range(height)
+            )
+        else:
+            data = data[: height * row_bytes]
+        return RawFrame(width, height, data)
+
+    def _sample_to_frame(self, sample):
         try:
             buffer = sample.get_buffer()
             caps = sample.get_caps()
@@ -890,6 +1063,12 @@ class ScreenCapture:
                 return None
 
             try:
+                if np is None:
+                    # Every pipeline ends in format=RGB caps
+                    if fmt not in (None, "RGB"):
+                        raise ValueError(f"unsupported format without numpy: {fmt}")
+                    return self._raw_rgb_frame(map_info.data, width, height, stride)
+
                 if fmt in ("RGBA", "RGBx", "BGRA", "BGRx"):
                     bpp = 4
                 elif fmt in ("BGR15", "RGB15"):

@@ -5,7 +5,12 @@ around the video content, enabling accurate color sampling from
 non-black areas only.
 """
 
-import numpy as np
+from __future__ import annotations
+
+try:
+    import numpy as np
+except ImportError:  # only used when numpy is available (see capture.py)
+    np = None
 from typing import Optional, Tuple
 from dataclasses import dataclass
 

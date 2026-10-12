@@ -36,6 +36,7 @@ class AppContext:
             restore_token=settings.capture.restore_token,
             backend=settings.capture.backend,
             max_fps=settings.sync.fps,
+            pipewire_node=settings.capture.pipewire_node,
         )
         self.capture.set_on_restore_token_changed(self._on_restore_token_changed)
         self.zone_processor = ZoneProcessor(settings=settings.zones)
@@ -123,6 +124,7 @@ class AppContext:
             self.capture.update_scale_factor(capture.scale_factor)
             self.capture.source_type = capture.source_type
             self.capture.update_backend(capture.backend, self.settings.sync.fps)
+            self.capture.update_pipewire_node(capture.pipewire_node)
 
             self.capture.update_black_bar_settings(self.settings.black_bar)
 

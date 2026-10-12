@@ -1,0 +1,11 @@
+{
+  "name": "Lumux",
+  "author": "sjredondo",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["lighting", "philips-hue", "ambilight"],
+    "description": "Sync Philips Hue lights to your screen in Game Mode. Uses the Lumux Flatpak (pair your bridge there first).",
+    "image": "https://raw.githubusercontent.com/sjredondo/lumux/main/assets/screenshots/screenshot1.png"
+  }
+}

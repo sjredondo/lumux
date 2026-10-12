@@ -60,6 +60,7 @@ class FakeBridge:
     def __init__(self):
         self.puts = []  # (path, body)
         self.frames = 0
+        self.link_pressed = False  # pairing: POST /api succeeds only when True
         self._tmp = tempfile.mkdtemp(prefix="fakehue")
         self._http = None
         self._dtls = None
@@ -98,6 +99,16 @@ class FakeBridge:
                 if p == f"entertainment_configuration/{ENT_ID}":
                     return self._send({"data": [ENT_CONFIG]})
                 return self._send({"errors": []}, 404)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if self.path != "/api" or "devicetype" not in body:
+                    return self._send({"errors": []}, 404)
+                if not bridge.link_pressed:
+                    return self._send([{"error": {"type": 101, "address": "",
+                                                  "description": "link button not pressed"}}])
+                return self._send([{"success": {"username": APP_KEY, "clientkey": CLIENT_KEY}}])
 
             def do_PUT(self):
                 length = int(self.headers.get("Content-Length", 0))
