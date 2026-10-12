@@ -35,12 +35,15 @@ class SyncController:
 
         self.running = False
         self.thread: Optional[threading.Thread] = None
-        self.previous_colors: Dict[str, Tuple[Tuple[float, float], int]] = {}
         self.queue: queue.Queue = queue.Queue(maxsize=100)
         self.lock = threading.Lock()
 
         # Zone to channel mapping for entertainment streaming
         self._zone_channel_map: Dict[str, int] = {}
+        self._mapped_layout: Optional[tuple] = None
+        self._last_hue_colors: Optional[Dict[str, Tuple[Tuple[float, float], int]]] = None
+        self._last_sent: Optional[Dict[int, Tuple[Tuple[float, float], int]]] = None
+        self._reported_capture_error = ""
 
         self._stats = {
             "fps": 0,
@@ -61,20 +64,14 @@ class SyncController:
         if self.running:
             return
 
-        # Build zone to channel mapping for entertainment streaming
-        if self.entertainment_stream:
-            timed_print(
-                f"Entertainment stream object exists, connected={self.entertainment_stream.is_connected()}"
-            )
-            if self.entertainment_stream.is_connected():
-                self._build_zone_channel_mapping()
-                timed_print(
-                    f"Using entertainment streaming with {len(self._zone_channel_map)} zone-channel mappings"
-                )
-            else:
-                timed_print("Warning: Entertainment stream exists but not connected")
-        else:
+        if self.entertainment_stream is None:
             timed_print("Warning: No entertainment stream configured")
+        self._zone_channel_map.clear()
+        self._mapped_layout = None
+        self._last_hue_colors = None
+        self._last_sent = None
+        self._reported_capture_error = ""
+        self.color_analyzer.previous_colors = {}
 
         self.running = True
         self.thread = threading.Thread(
@@ -96,12 +93,15 @@ class SyncController:
 
         # Get all zone IDs for ambilight layout
         # top_0..top_n, left_0..left_n, right_0..right_n, bottom_0..bottom_n
+        # Must match ZoneProcessor: `cols` zones on top/bottom, `rows` zones on
+        # left/right. (Using rows // 2 here left the lower half of both side
+        # edges unmapped, so it never reached any light.)
         zones = []
         for edge in ["top", "bottom", "left", "right"]:
             if edge in ["top", "bottom"]:
                 count = self.zone_processor.cols
             else:
-                count = max(1, self.zone_processor.rows // 2)
+                count = max(1, self.zone_processor.rows)
             for i in range(count):
                 zones.append(f"{edge}_{i}")
 
@@ -132,21 +132,18 @@ class SyncController:
 
         # Convert screen edge/index to expected position range
         # Entertainment positions: x is left(-1) to right(+1), z is bottom(-1) to top(+1)
+        # Side zones go from top (idx=0) to bottom (idx=rows-1)
+        side_z = (
+            1.0 - (idx * 2.0 / (self.zone_processor.rows - 1))
+            if self.zone_processor.rows > 1
+            else 0
+        )
         if edge == "left":
             target_x = -1.0
-            # Left zones go from top (idx=0) to bottom (idx=n)
-            target_z = (
-                1.0 - (idx * 2.0 / max(1, self.zone_processor.rows // 2 - 1))
-                if self.zone_processor.rows > 2
-                else 0
-            )
+            target_z = side_z
         elif edge == "right":
             target_x = 1.0
-            target_z = (
-                1.0 - (idx * 2.0 / max(1, self.zone_processor.rows // 2 - 1))
-                if self.zone_processor.rows > 2
-                else 0
-            )
+            target_z = side_z
         elif edge == "top":
             target_z = 1.0
             target_x = (
@@ -184,6 +181,9 @@ class SyncController:
             return
 
         self.running = False
+        # Unblock a pending screen-share dialog so the thread can exit
+        if hasattr(self.capture, "cancel_pending"):
+            self.capture.cancel_pending()
 
         if self.thread:
             self.thread.join(timeout=3)
@@ -253,26 +253,50 @@ class SyncController:
         self._queue_status("status", "stopped", None)
 
     def _process_frame(self):
-        """Process a single frame."""
+        """Process a single frame.
+
+        PipeWire only delivers frames when the screen changes, so on a static
+        screen the same frame used to be re-cropped, re-zoned and re-analysed
+        30 times a second. Now an unchanged frame reuses the previous zone
+        analysis and only the (cheap) smoothing step runs.
+        """
         t0 = time.time()
 
-        t_capture = time.time()
-        screen = self.capture.capture()
-        t_capture = time.time() - t_capture
-        if screen is None:
-            return
+        # poll() pulls the newest frame, if any, without blocking
+        reuse = (
+            self._last_hue_colors is not None
+            and self.capture.is_capturing()
+            and not self.capture.poll()
+        )
 
-        t_zones = time.time()
-        zone_colors = self.zone_processor.process_image(screen)
-        t_zones = time.time() - t_zones
-        if not zone_colors or len(zone_colors) == 0:
-            return
+        t_capture = t_zones = t_analyze = 0.0
+        zone_colors = None
+        if reuse:
+            hue_colors = self._last_hue_colors
+        else:
+            t_capture = time.time()
+            screen = self.capture.capture()
+            t_capture = time.time() - t_capture
+            if screen is None:
+                error = getattr(self.capture, "last_error", "")
+                if error and error != self._reported_capture_error:
+                    self._queue_status("warning", error, None)
+                self._reported_capture_error = error
+                return
+            self._reported_capture_error = ""
 
-        t_analyze = time.time()
-        hue_colors = self.color_analyzer.analyze_zones_batch(zone_colors)
-        t_analyze = time.time() - t_analyze
-        if not hue_colors or len(hue_colors) == 0:
-            return
+            t_zones = time.time()
+            zone_colors = self.zone_processor.process_image(screen)
+            t_zones = time.time() - t_zones
+            if not zone_colors:
+                return
+
+            t_analyze = time.time()
+            hue_colors = self.color_analyzer.analyze_zones_batch(zone_colors)
+            t_analyze = time.time() - t_analyze
+            if not hue_colors:
+                return
+            self._last_hue_colors = hue_colors
 
         t_smooth = time.time()
         smoothed_colors = self.color_analyzer.apply_smoothing(
@@ -297,47 +321,43 @@ class SyncController:
                 "total": round(total, 4),
             }
 
-        # Send RGB colors to GUI for preview, not XY colors
-        self._queue_status("status", "syncing", zone_colors)
+        # Send RGB colors to GUI for preview (only when they changed)
+        if zone_colors is not None:
+            self._queue_status("status", "syncing", zone_colors)
 
     def _update_lights(self, hue_colors: Dict[str, Tuple[Tuple[float, float], int]]):
-        """Send color updates via entertainment streaming."""
-        if not hue_colors:
+        """Hand colours to the entertainment stream's sender thread."""
+        stream = self.entertainment_stream
+        if not hue_colors or stream is None or not stream.is_active():
             return
 
-        if (
-            not self.entertainment_stream
-            or not self.entertainment_stream.is_connected()
-        ):
-            if self._stats["frame_count"] % 300 == 0:
-                timed_print(
-                    "Warning: Entertainment stream not connected, skipping update"
-                )
-            return
+        layout = (self.zone_processor.rows, self.zone_processor.cols, len(stream.channels))
+        if layout != self._mapped_layout:
+            self._build_zone_channel_mapping()
+            self._mapped_layout = layout
 
-        # Convert zone colors to channel colors
-        channel_colors: Dict[int, Tuple[Tuple[float, float], int]] = {}
-
-        for zone_id, color_data in hue_colors.items():
+        # Average every zone that maps to a channel (the old pairwise running
+        # average weighted the last zone at 50%).
+        sums: Dict[int, list] = {}
+        for zone_id, ((x, y), brightness) in hue_colors.items():
             channel_id = self._zone_channel_map.get(zone_id)
             if channel_id is None:
                 continue
-
-            xy, brightness = color_data
-
-            # If multiple zones map to the same channel, average them
-            if channel_id in channel_colors:
-                existing_xy, existing_bri = channel_colors[channel_id]
-                # Simple average
-                new_xy = ((existing_xy[0] + xy[0]) / 2, (existing_xy[1] + xy[1]) / 2)
-                new_bri = (existing_bri + brightness) // 2
-                channel_colors[channel_id] = (new_xy, new_bri)
+            acc = sums.get(channel_id)
+            if acc is None:
+                sums[channel_id] = [x, y, brightness, 1]
             else:
-                channel_colors[channel_id] = (xy, brightness)
+                acc[0] += x
+                acc[1] += y
+                acc[2] += brightness
+                acc[3] += 1
 
-        # Send to all channels via DTLS
-        if channel_colors:
-            self.entertainment_stream.send_colors_xy(channel_colors)
+        channel_colors = {
+            cid: ((sx / n, sy / n), int(sb / n)) for cid, (sx, sy, sb, n) in sums.items()
+        }
+        if channel_colors and channel_colors != self._last_sent:
+            stream.send_colors_xy(channel_colors)
+            self._last_sent = channel_colors
 
     def _queue_status(self, status_type: str, message, data=None):
         """Queue status update for GUI thread."""

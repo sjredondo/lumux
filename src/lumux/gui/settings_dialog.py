@@ -183,6 +183,26 @@ class SettingsDialog(Adw.PreferencesDialog):
         )
         capture_group.add(self.capture_source_row)
 
+        # Capture method: portal (Wayland) or X11 grab (e.g. SteamOS Desktop Mode)
+        self._capture_backends = ["auto", "portal", "x11"]
+        self.capture_backend_row = Adw.ComboRow()
+        self.capture_backend_row.set_title("Capture Method")
+        self.capture_backend_row.set_subtitle(
+            "Automatic uses X11 capture on X11 sessions (SteamOS Desktop Mode)"
+        )
+        self.capture_backend_row.set_model(
+            Gtk.StringList.new(
+                ["Automatic", "Screen-cast portal (Wayland)", "X11 screen grab"]
+            )
+        )
+        backend = getattr(self.settings.capture, "backend", "auto")
+        self.capture_backend_row.set_selected(
+            self._capture_backends.index(backend)
+            if backend in self._capture_backends
+            else 0
+        )
+        capture_group.add(self.capture_backend_row)
+
         # Resolution scale
         self.scale_row = Adw.SpinRow.new_with_range(0.01, 1.0, 0.01)
         self.scale_row.set_title("Resolution Scale")
@@ -585,6 +605,9 @@ class SettingsDialog(Adw.PreferencesDialog):
             "window" if self.capture_source_row.get_selected() == 1 else "screen"
         )
         self.settings.capture.scale_factor = self.scale_row.get_value()
+        self.settings.capture.backend = self._capture_backends[
+            min(self.capture_backend_row.get_selected(), len(self._capture_backends) - 1)
+        ]
 
         # Black bar settings
         try:

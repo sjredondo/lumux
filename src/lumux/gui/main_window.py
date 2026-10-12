@@ -663,7 +663,7 @@ class MainWindow(Adw.ApplicationWindow):
             application_name="Lumux",
             application_icon="io.github.enginkirmaci.lumux",
             developer_name="Engin Kırmacı",
-            version="0.6.2",
+            version="0.7.0",
             comments=(
                 "Sync your Philips Hue lights with your screen in real time. "
                 "Lumux captures screen content, maps it to your configured entertainment "
@@ -776,6 +776,9 @@ class MainWindow(Adw.ApplicationWindow):
                     self.sync_button.set_sensitive(True)
                     if self._should_minimize_to_tray():
                         self.present()
+            elif status_type == "warning":
+                # Sync keeps running (e.g. waiting for screen-share consent)
+                self.status_subtitle.set_text(message)
             elif status_type == "error":
                 self.status_label.set_text("Error")
                 self.status_subtitle.set_text(message)
@@ -796,19 +799,30 @@ class MainWindow(Adw.ApplicationWindow):
             self.status_subtitle.set_text("Bridge not connected")
             return
 
-        # Use mode manager to switch to video mode
-        if self.mode_manager.switch_to_video():
+        # Connect in the background so the window stays responsive while the
+        # bridge activates the area and the DTLS handshake runs.
+        self.sync_button.set_sensitive(False)
+        self.status_label.set_text("Starting...")
+        self.status_subtitle.set_text("Connecting entertainment streaming")
+        self._update_status_card("syncing")
+        self.mode_manager.switch_to_video(callback=self._on_video_started)
+
+    def _on_video_started(self, ok: bool):
+        """Result of the background switch_to_video()."""
+        self.sync_button.set_sensitive(True)
+        if ok:
             self._update_sync_button_state(True)
-            self.sync_button.set_sensitive(True)
-            self.status_label.set_text("Starting...")
-            self.status_subtitle.set_text("Connecting entertainment streaming")
-            self._update_status_card("syncing")
             # Optionally minimize to tray when sync begins
             if self._should_minimize_to_tray():
                 self.hide()
         else:
+            stream = self.app_context.entertainment_stream
+            reason = getattr(stream, "last_error", "") if stream else ""
+            if not stream:
+                reason = "No entertainment area configured; open Settings"
+            self._update_sync_button_state(False)
             self.status_label.set_text("Connection Failed")
-            self.status_subtitle.set_text("Check entertainment zone settings")
+            self.status_subtitle.set_text(reason or "Check entertainment zone settings")
             self._update_status_card("disconnected")
 
     def _on_stop_clicked(self, button):
