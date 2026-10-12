@@ -6,6 +6,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, GLib, Adw, Gdk, Gio
+from lumux import __version__
 from lumux.app_context import AppContext
 from lumux.mode_manager import Mode
 from lumux.utils.rgb_xy_converter import xy_to_rgb, rgb_to_xy
@@ -663,7 +664,7 @@ class MainWindow(Adw.ApplicationWindow):
             application_name="Lumux",
             application_icon="io.github.enginkirmaci.lumux",
             developer_name="Engin Kırmacı",
-            version="0.7.1",
+            version=__version__,
             comments=(
                 "Sync your Philips Hue lights with your screen in real time. "
                 "Lumux captures screen content, maps it to your configured entertainment "

@@ -77,6 +77,16 @@
   </branding>
 
   <releases>
+    <release version="0.8.0" date="2026-10-13">
+      <description>
+        <p>SteamOS Game Mode support:</p>
+        <ul>
+          <li>New headless lumux-daemon, controlled over a local socket, used by the Lumux Decky Loader plugin</li>
+          <li>Screen capture from gamescope's PipeWire output in Game Mode, without a screen-share dialog</li>
+          <li>Pair with the bridge from Game Mode by pressing its link button</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.1" date="2026-10-13">
       <description>
         <p>Fixes screen capture on Wayland inside Flatpak (lights stayed dark): Lumux now connects to PipeWire through the screen-cast portal, warns when capture delivers no frames, and explains when X11 capture can't be used.</p>

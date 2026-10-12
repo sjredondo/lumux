@@ -1,0 +1,8 @@
+node_modules
+.pnpm-store
+dist/
+out/
+cli/
+__pycache__/
+backend/out
+decky_plugin.py

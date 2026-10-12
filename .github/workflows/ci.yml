@@ -21,10 +21,11 @@ jobs:
           sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
           pacman -Syu --noconfirm --needed git python python-gobject python-cairo gtk4 libadwaita \
             gstreamer gst-plugins-base gst-plugins-good python-numpy python-pillow python-requests \
-            python-urllib3 python-zeroconf python-pytest python-pip openssl xorg-server-xvfb
+            python-urllib3 python-zeroconf python-pytest python-pip openssl xorg-server-xvfb \
+            pipewire wireplumber gst-plugin-pipewire
           pip install --break-system-packages pydbus
       - uses: actions/checkout@v4
-      - name: Run tests (fake Hue bridge + X11 capture under Xvfb)
+      - name: Run tests (fake Hue bridge, X11 capture under Xvfb, fake gamescope node)
         run: PYTHONPATH=src:tests xvfb-run -a -s "-screen 0 1280x800x24" python -m pytest -v -W ignore::Warning tests
 
   flatpak:
@@ -46,10 +47,35 @@ jobs:
           name: lumux-flatpak
           path: lumux.flatpak
 
+  decky:
+    name: Decky plugin zip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Decky CLI (the version the plugin store CI uses)
+        run: |
+          mkdir -p /tmp/decky-cli
+          curl -fL -o /tmp/decky-cli/decky \
+            https://github.com/SteamDeckHomebrew/cli/releases/download/0.0.7/decky-linux-x86_64
+          chmod +x /tmp/decky-cli/decky
+      - name: Build plugin (same command as decky-plugin-database)
+        run: |
+          sudo /tmp/decky-cli/decky plugin build -b -o out -s plugin-name decky
+          sudo chown -R "$(id -u):$(id -g)" decky out
+          mv out/Lumux.zip lumux-decky.zip
+      - name: Check zip layout
+        run: |
+          unzip -l lumux-decky.zip
+          python3 scripts/check-decky-zip.py lumux-decky.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumux-decky
+          path: lumux-decky.zip
+
   release:
     name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, flatpak]
+    needs: [test, flatpak, decky]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -57,7 +83,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: lumux-flatpak
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumux-decky
       - uses: softprops/action-gh-release@v2
         with:
-          files: lumux.flatpak
+          files: |
+            lumux.flatpak
+            lumux-decky.zip
           generate_release_notes: true

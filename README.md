@@ -45,7 +45,36 @@ If you previously installed Lumux from Flathub, uninstall it first
 
 SteamOS Desktop Mode runs an X11 session, which has no screen-cast portal; Lumux detects
 this and captures the screen through X11 instead (Settings → Capture → Capture Method).
-Sync runs in Desktop Mode only; Game Mode (gamescope) isn't supported.
+
+### SteamOS Game Mode (Decky Loader plugin)
+
+In Game Mode, sync is controlled from the Quick Access menu by the **Lumux Decky
+plugin** in [`decky/`](decky/). It starts a headless `lumux-daemon` from the Lumux
+Flatpak, which reads gamescope's screen straight from PipeWire (no consent dialog).
+
+1. Install [Decky Loader](https://decky.xyz) and the Lumux Flatpak (above, v0.8.0+).
+2. Pair the bridge, either in the Lumux desktop app in Desktop Mode or later from the
+   plugin with the bridge's link button.
+3. Download `lumux-decky.zip` from the
+   [latest release](https://github.com/sjredondo/lumux/releases/latest).
+4. In Game Mode: Decky → ⚙ Settings → Developer → enable Developer mode →
+   **Install Plugin from ZIP File** (or **from URL** with the asset link).
+5. Quick Access (`…`) → Lumux → pick the entertainment area → **Sync lights**.
+
+More detail, logs and troubleshooting: [decky/README.md](decky/README.md).
+
+#### Headless daemon
+
+`lumux-daemon` runs the bridge, streaming, sync and capture without GTK, controlled over
+a Unix socket (`$XDG_RUNTIME_DIR/app/io.github.enginkirmaci.lumux/daemon.sock`, JSON
+lines: `status`, `start`, `stop`, `set_brightness`, `list_areas`, `select_area`, `pair`,
+`discover`, `list_nodes`, `set_node`, `shutdown`). It uses the desktop app's
+`settings.json`.
+
+```bash
+flatpak run --command=lumux-daemon io.github.enginkirmaci.lumux --backend gamescope
+flatpak run --command=lumux-daemon io.github.enginkirmaci.lumux --ctl status
+```
 
 ### Flathub (upstream)
 
@@ -183,21 +212,57 @@ lumux
   connecting, and portal setup no longer iterates GTK's main loop from a worker thread.
 - **Fixed zone mapping.** The lower half of the left/right screen edges was never mapped to a
   light, and zones sharing a light were averaged unevenly.
-- **Tests.** `tests/` runs against a fake Hue bridge (HTTPS + DTLS) and real X11 capture.
+- **Tests.** `tests/` runs against a fake Hue bridge (HTTPS + DTLS), real X11 capture and a
+  fake gamescope PipeWire node.
+- **Game Mode.** A headless `lumux-daemon`, a `gamescope` capture backend (PipeWire node,
+  no portal) and a Decky Loader plugin (`decky/`). numpy/Pillow are optional for the
+  daemon's capture path.
 
 ### Running the tests
 
-The end-to-end tests need root (ports 443/2100), `openssl` and an X server, so run them in
-a container, e.g. Arch:
+The end-to-end tests need root (ports 443/2100), `openssl`, an X server and PipeWire, so
+run them in a container, e.g. Arch (on Apple Silicon keep `--platform linux/amd64`; the
+`DisableSandbox` line is needed for pacman under emulation):
 
 ```bash
-docker run --rm -v "$PWD":/src:ro archlinux bash -c '
+docker run --rm --platform linux/amd64 -v "$PWD":/src:ro archlinux bash -c '
+  sed -i "/^\[options\]/a DisableSandbox" /etc/pacman.conf &&
   pacman -Syu --noconfirm --needed python-gobject python-cairo gtk4 libadwaita gstreamer \
     gst-plugins-base gst-plugins-good python-numpy python-pillow python-requests \
-    python-urllib3 python-zeroconf python-pytest python-pip openssl xorg-server-xvfb &&
+    python-urllib3 python-zeroconf python-pytest python-pip openssl xorg-server-xvfb \
+    pipewire wireplumber gst-plugin-pipewire &&
   pip install --break-system-packages pydbus && cp -r /src /w && cd /w &&
   PYTHONPATH=src:tests xvfb-run -a -s "-screen 0 1280x800x24" python -m pytest -v tests'
 ```
+
+The Decky plugin zip is built with the [Decky CLI](https://github.com/SteamDeckHomebrew/cli)
+(needs Docker), exactly like the plugin store does:
+
+```bash
+decky plugin build -o out -s plugin-name decky   # -> out/Lumux.zip
+python3 scripts/check-decky-zip.py out/Lumux.zip
+```
+
+### Submitting the Decky plugin to the store (later)
+
+The plugin store builds each plugin from the root of a git submodule, so `decky/` is kept
+self-contained (it never imports from the rest of this repo). To submit:
+
+1. Split it into its own repository with history:
+   `git subtree split --prefix=decky -b decky-plugin` and push that branch to a new
+   repo, e.g. `sjredondo/decky-lumux`. Nothing inside `decky/` has to change.
+2. Bump `version` in `decky/package.json`; check `plugin.json` (`name`, `author`,
+   `publish.tags`, `publish.description`, `publish.image`). `flags` stays empty (no root).
+3. Make sure a Lumux Flatpak release with `lumux-daemon` is published, since the plugin
+   depends on it.
+4. Test on the **Stable and Beta** SteamOS channels (Python backend, no custom binaries, so
+   the Preview channel isn't required).
+5. Fork [decky-plugin-database](https://github.com/SteamDeckHomebrew/decky-plugin-database),
+   add the repo as a submodule under `plugins/`, and open a PR with the "plugin addition"
+   template. Its checklist asks you to confirm that you are the original author and that
+   **generative AI did not write a majority of the code**. Much of this plugin was written
+   with an AI assistant, so read that requirement and decide before submitting.
+6. Optional but encouraged: test two other pending plugins and link your reports.
 
 ## Contributing
 
