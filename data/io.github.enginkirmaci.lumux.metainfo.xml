@@ -77,6 +77,11 @@
   </branding>
 
   <releases>
+    <release version="0.7.1" date="2026-10-13">
+      <description>
+        <p>Fixes screen capture on Wayland inside Flatpak (lights stayed dark): Lumux now connects to PipeWire through the screen-cast portal, warns when capture delivers no frames, and explains when X11 capture can't be used.</p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-10-13">
       <description>
         <p>Reliability and SteamOS fixes:</p>

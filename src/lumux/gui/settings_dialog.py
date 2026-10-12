@@ -188,7 +188,7 @@ class SettingsDialog(Adw.PreferencesDialog):
         self.capture_backend_row = Adw.ComboRow()
         self.capture_backend_row.set_title("Capture Method")
         self.capture_backend_row.set_subtitle(
-            "Automatic uses X11 capture on X11 sessions (SteamOS Desktop Mode)"
+            "Automatic picks the portal on Wayland and X11 grab on X11 sessions"
         )
         self.capture_backend_row.set_model(
             Gtk.StringList.new(
