@@ -33,6 +33,10 @@ class ReadingModeController:
         self._target_light_ids: List[str] = []
         self._entertainment_config_id = entertainment_config_id
     
+    def set_entertainment_config_id(self, config_id: str):
+        """Scope reading mode to a (new) entertainment area."""
+        self._entertainment_config_id = config_id
+
     def set_target_lights(self, light_ids: List[str]):
         """Set which lights to control in reading mode.
         
@@ -61,14 +65,9 @@ class ReadingModeController:
         if brightness is not None:
             self._state.brightness = brightness
         
-        # Ensure bridge devices are refreshed before getting lights
-        if hasattr(self.bridge, 'refresh_devices'):
-            try:
-                self.bridge.refresh_devices()
-            except Exception as e:
-                timed_print(f"Reading mode: Could not refresh devices: {e}")
-        
-        # Get lights to control
+        # Get lights to control (entertainment-area members only; cached, so
+        # dragging the colour/brightness controls doesn't refetch every
+        # device on the bridge)
         light_ids = self._get_target_light_ids()
         if not light_ids:
             timed_print("Reading mode: No lights to control")
@@ -175,6 +174,12 @@ class ReadingModeController:
         """
         if self._target_light_ids:
             return self._target_light_ids
+        if not self._entertainment_config_id:
+            timed_print(
+                "Reading mode: No entertainment area selected; "
+                "refusing to control lights outside an area"
+            )
+            return []
 
         config_id = self._entertainment_config_id
         if config_id and hasattr(self.bridge, 'get_entertainment_light_ids'):

@@ -34,6 +34,8 @@ class AppContext:
             black_bar_settings=settings.black_bar,
             source_type=settings.capture.source_type,
             restore_token=settings.capture.restore_token,
+            backend=settings.capture.backend,
+            max_fps=settings.sync.fps,
         )
         self.capture.set_on_restore_token_changed(self._on_restore_token_changed)
         self.zone_processor = ZoneProcessor(settings=settings.zones)
@@ -95,7 +97,7 @@ class AppContext:
 
     def stop_entertainment(self):
         """Disconnect from entertainment streaming zone."""
-        if self.entertainment_stream and self.entertainment_stream.is_connected():
+        if self.entertainment_stream and self.entertainment_stream.is_active():
             self.entertainment_stream.disconnect(self.bridge)
 
     def shutdown(self) -> None:
@@ -113,18 +115,14 @@ class AppContext:
         """Apply current settings to live components atomically."""
         with self._settings_lock:
             hue = self.settings.hue
-            if (self.bridge.bridge_ip, self.bridge.app_key) != (
-                hue.bridge_ip,
-                hue.app_key,
-            ):
-                self.bridge.bridge_ip = hue.bridge_ip
-                self.bridge.app_key = hue.app_key
-                self.bridge.hue = None
-                self.bridge.bridge = None
+            # Re-pairing changes app_key/client_key; the old client would keep
+            # using the stale key (401s / failed DTLS PSK handshakes).
+            self.bridge.update_credentials(hue.bridge_ip, hue.app_key)
 
             capture = self.settings.capture
             self.capture.update_scale_factor(capture.scale_factor)
             self.capture.source_type = capture.source_type
+            self.capture.update_backend(capture.backend, self.settings.sync.fps)
 
             self.capture.update_black_bar_settings(self.settings.black_bar)
 
@@ -135,22 +133,32 @@ class AppContext:
             self.zone_processor.cols = int(self.settings.zones.cols)
             self.zone_processor._rebuild_zone_ids()
 
-            if hue.client_key and hue.entertainment_config_id:
-                if (
-                    self.entertainment_stream is None
-                    or self.entertainment_stream.entertainment_config_id
-                    != hue.entertainment_config_id
-                ):
-                    self.stop_entertainment()
-                    self.entertainment_stream = EntertainmentStream(
-                        bridge_ip=hue.bridge_ip,
-                        app_key=hue.app_key,
-                        client_key=hue.client_key,
-                        entertainment_config_id=hue.entertainment_config_id,
-                    )
-                    self.sync_controller.entertainment_stream = (
-                        self.entertainment_stream
-                    )
+            stream = self.entertainment_stream
+            wanted = bool(hue.client_key and hue.entertainment_config_id)
+            if stream is not None and (
+                not wanted
+                or not stream.matches(
+                    hue.bridge_ip, hue.app_key, hue.client_key, hue.entertainment_config_id
+                )
+            ):
+                if self.sync_controller.is_running():
+                    self.sync_controller.stop()
+                self.stop_entertainment()
+                stream = None
+            if wanted and stream is None:
+                stream = EntertainmentStream(
+                    bridge_ip=hue.bridge_ip,
+                    app_key=hue.app_key,
+                    client_key=hue.client_key,
+                    entertainment_config_id=hue.entertainment_config_id,
+                )
+            self.entertainment_stream = stream
+            self.sync_controller.entertainment_stream = stream
+            if hasattr(self, "mode_manager"):
+                # Previously only the sync controller got the new stream, so a
+                # freshly paired bridge failed with "No entertainment stream
+                # configured" until Lumux was restarted.
+                self.mode_manager.set_entertainment(stream, hue.entertainment_config_id)
 
             if hasattr(self, "mode_manager"):
                 self.mode_manager.reading_settings = self.settings.reading_mode

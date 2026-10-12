@@ -5,13 +5,11 @@ low-latency color updates to lights in an entertainment zone using DTLS over UDP
 """
 
 import struct
-import subprocess
 import threading
 import time
-from dataclasses import dataclass
-from enum import IntEnum
 from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
+from lumux.dtls import DTLSClient, DTLSError
 from lumux.utils.logging import timed_print
 
 if TYPE_CHECKING:
@@ -57,7 +55,22 @@ class ChannelInfo:
 
 
 class EntertainmentStream:
-    """Manages DTLS connection and streaming to a Hue Entertainment zone."""
+    """Manages the DTLS session and streaming to a Hue Entertainment zone.
+
+    Colours are pushed with ``send_colors_xy()`` from the sync loop, but the
+    actual transmission happens on a dedicated sender thread at a fixed rate.
+    This matters because the bridge silently ends a streaming session after
+    ~10 seconds without packets: previously Lumux only sent a packet when a
+    screen frame arrived, so a slow screen-share consent dialog, a static
+    screen, or a capture backend that never produced frames (e.g. no portal
+    ScreenCast on SteamOS Desktop Mode) left the lights dead. The sender
+    thread also detects a dropped session and reconnects with backoff.
+    """
+
+    # Bridge forwards to lights at 25 Hz; streaming a bit faster than that
+    # covers occasional UDP loss without wasting CPU.
+    STREAM_HZ = 30
+    RECONNECT_BACKOFF_MAX = 10.0
 
     def __init__(
         self,
@@ -65,8 +78,7 @@ class EntertainmentStream:
         app_key: str,
         client_key: str,
         entertainment_config_id: str,
-        connection_timeout: float = 0.5,
-        handshake_delay: float = 0.3,
+        handshake_timeout: float = 5.0,
     ):
         """Initialize entertainment stream.
 
@@ -75,22 +87,23 @@ class EntertainmentStream:
             app_key: Application key (username) - used to get hue-application-id
             client_key: Client key - used as PSK (32-byte hex string)
             entertainment_config_id: ID of the entertainment configuration to stream to
-            connection_timeout: Time to wait for DTLS connection (seconds)
-            handshake_delay: Additional time for handshake completion (seconds)
+            handshake_timeout: Max time to wait for the DTLS handshake (seconds)
         """
         self.bridge_ip = bridge_ip
         self.app_key = app_key
         self.client_key = client_key
         self.entertainment_config_id = entertainment_config_id
-        self._connection_timeout = connection_timeout
-        self._handshake_delay = handshake_delay
+        self._handshake_timeout = handshake_timeout
 
         self._application_id: Optional[str] = None
-        self._openssl_proc: Optional[subprocess.Popen] = None
-        self._dtls_socket = None  # Future: native DTLS implementation
-        self._connected = False
+        self._transport: Optional[DTLSClient] = None
+        self._bridge: Optional["HueBridge"] = None
+        self._active = False
         self._sequence = 0
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._sender: Optional[threading.Thread] = None
+        self.last_error: str = ""
 
         # Channel mappings
         self._channels: Dict[int, ChannelInfo] = {}
@@ -100,6 +113,8 @@ class EntertainmentStream:
         self._sorted_channel_ids: list[int] = []
         self._encoded_config_id: bytes = self.entertainment_config_id.encode("ascii")
         self._message_buffer: bytearray = bytearray()
+        # Latest frame to transmit (rebuilt by send_colors*, read by sender)
+        self._pending_message: Optional[bytes] = None
 
     @property
     def channels(self) -> Dict[int, ChannelInfo]:
@@ -108,43 +123,153 @@ class EntertainmentStream:
 
     @property
     def light_to_channel(self) -> Dict[str, int]:
-        """Reverse mapping: light_id -> channel_id."""
+        """Reverse mapping: entertainment service rid -> channel_id."""
         return self._light_to_channel
 
-    def connect(self, bridge: "HueBridge") -> bool:
-        """Establish DTLS connection to the bridge.
+    def matches(self, bridge_ip: str, app_key: str, client_key: str, config_id: str) -> bool:
+        """True if this stream was built for exactly these credentials."""
+        return (self.bridge_ip, self.app_key, self.client_key, self.entertainment_config_id) == (
+            bridge_ip,
+            app_key,
+            client_key,
+            config_id,
+        )
 
-        Args:
-            bridge: HueBridge instance to use for API calls
+    def connect(self, bridge: "HueBridge") -> bool:
+        """Activate streaming on the bridge, handshake, and start the sender.
+
+        Blocks for up to a few seconds (REST + DTLS handshake); call it off
+        the GTK main thread.
 
         Returns:
-            True if connection successful, False otherwise
+            True if connection successful, False otherwise (see last_error)
         """
+        if self._active:
+            return True
+        self.last_error = ""
+        if not self.client_key:
+            self.last_error = "No client key; re-pair the bridge in Settings"
+            print(self.last_error)
+            return False
         try:
             config = self._fetch_entertainment_config(bridge)
             if not config:
+                self.last_error = "Entertainment area not found on bridge"
                 return False
 
             self._parse_channels(config)
             self._init_message_buffer()
             self._application_id = self._fetch_application_id(bridge)
+            self._bridge = bridge
 
-            if not self._activate_streaming(bridge):
+            if not self._open_session(bridge):
                 return False
 
-            if not self._establish_dtls_connection():
-                self._deactivate_streaming(bridge)
-                return False
-
-            self._connected = True
+            self._active = True
+            self._stop_event.clear()
+            # Lights go dark until the first captured frame arrives
+            self.send_colors_xy({})
+            self._sender = threading.Thread(
+                target=self._sender_loop, daemon=True, name="HueStreamSender"
+            )
+            self._sender.start()
             timed_print(
                 f"Entertainment stream connected with {len(self._channels)} channels"
             )
             return True
 
         except Exception as e:
+            self.last_error = str(e)
             print(f"Error connecting entertainment stream: {e}")
             return False
+
+    def _open_session(self, bridge: "HueBridge") -> bool:
+        """Activate the entertainment config and complete the DTLS handshake."""
+        if not bridge.activate_entertainment_streaming(self.entertainment_config_id):
+            self.last_error = (
+                "Bridge refused to start streaming (is another app such as "
+                "Hue Sync already streaming to this area?)"
+            )
+            print(self.last_error)
+            return False
+
+        identity = self._application_id or self.app_key
+        transport = DTLSClient(
+            self.bridge_ip, HueStreamProtocol.PORT, identity, self.client_key
+        )
+        try:
+            transport.connect(timeout=self._handshake_timeout)
+        except DTLSError as e:
+            self.last_error = str(e)
+            print(f"DTLS connection to {self.bridge_ip} failed: {e}")
+            self._deactivate_streaming(bridge)
+            return False
+
+        with self._lock:
+            self._transport = transport
+        timed_print(
+            f"DTLS connection established to {self.bridge_ip}:{HueStreamProtocol.PORT}"
+        )
+        return True
+
+    def _close_transport(self, notify: bool = True) -> None:
+        with self._lock:
+            transport, self._transport = self._transport, None
+        if transport:
+            try:
+                transport.close(notify=notify)
+            except Exception:
+                pass
+
+    def _sender_loop(self) -> None:
+        """Transmit the latest frame at STREAM_HZ; reconnect if the bridge drops us."""
+        interval = 1.0 / self.STREAM_HZ
+        backoff = 1.0
+        next_tick = time.monotonic()
+        poll_counter = 0
+
+        while not self._stop_event.is_set():
+            transport = self._transport
+            if transport is None or transport.closed:
+                self._close_transport(notify=False)
+                timed_print(
+                    f"Entertainment stream lost; reconnecting in {backoff:.0f}s..."
+                )
+                if self._stop_event.wait(backoff):
+                    break
+                bridge = self._bridge
+                if bridge is not None:
+                    self._deactivate_streaming(bridge)
+                    if self._open_session(bridge):
+                        backoff = 1.0
+                        next_tick = time.monotonic()
+                        continue
+                backoff = min(backoff * 2, self.RECONNECT_BACKOFF_MAX)
+                continue
+
+            message = self._pending_message
+            if message is not None:
+                try:
+                    transport.send(message)
+                except DTLSError as e:
+                    print(f"DTLS connection lost: {e}")
+                    continue
+
+            # Check for close_notify / ICMP errors about twice a second
+            poll_counter += 1
+            if poll_counter >= self.STREAM_HZ // 2:
+                poll_counter = 0
+                if transport.poll_closed():
+                    print("Bridge closed the entertainment session")
+                    continue
+
+            next_tick += interval
+            delay = next_tick - time.monotonic()
+            if delay < -interval:
+                next_tick = time.monotonic()  # fell behind (suspend etc.)
+                delay = 0
+            if delay > 0:
+                self._stop_event.wait(delay)
 
     def _fetch_entertainment_config(self, bridge: "HueBridge") -> Optional[dict]:
         """Fetch entertainment configuration from bridge."""
@@ -173,14 +298,6 @@ class EntertainmentStream:
             "Warning: Could not get hue-application-id, falling back to app_key"
         )
         return self.app_key
-
-    def _activate_streaming(self, bridge: "HueBridge") -> bool:
-        """Activate streaming via REST API."""
-        if not bridge.activate_entertainment_streaming(self.entertainment_config_id):
-            print("Failed to activate entertainment streaming")
-            return False
-        time.sleep(self._connection_timeout)  # Give bridge time to prepare
-        return True
 
     def _deactivate_streaming(self, bridge: "HueBridge") -> None:
         """Deactivate streaming via REST API."""
@@ -246,180 +363,71 @@ class EntertainmentStream:
             self._map_member_to_channel(member, channel_id)
 
     def _map_member_to_channel(self, member: dict, channel_id: int) -> None:
-        """Map a member light to its channel."""
+        """Map a member's entertainment service to its channel."""
         service = member.get("service", {})
-        light_rid = service.get("rid")
-        if light_rid:
-            self._light_to_channel[light_rid] = channel_id
-
-    def _establish_dtls_connection(self) -> bool:
-        """Establish DTLS-PSK connection to bridge port 2100."""
-        try:
-            cmd = self._build_openssl_command()
-            timed_print(
-                f"Starting DTLS connection: "
-                f"openssl s_client -dtls1_2 -connect {self.bridge_ip}:{HueStreamProtocol.PORT}"
-            )
-
-            self._openssl_proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            return self._wait_for_handshake()
-
-        except FileNotFoundError:
-            print("DTLS connection failed: openssl command not found")
-            return False
-        except Exception as e:
-            print(f"DTLS connection failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    def _build_openssl_command(self) -> list[str]:
-        """Build OpenSSL command for DTLS-PSK connection."""
-        psk_identity = self._application_id or self.app_key
-        return [
-            "openssl",
-            "s_client",
-            "-dtls1_2",
-            "-psk_identity",
-            psk_identity,
-            "-psk",
-            self.client_key,
-            "-cipher",
-            "PSK-AES128-GCM-SHA256:PSK-CHACHA20-POLY1305",
-            "-connect",
-            f"{self.bridge_ip}:{HueStreamProtocol.PORT}",
-            "-quiet",
-        ]
-
-    def _wait_for_handshake(self) -> bool:
-        """Wait for DTLS handshake to complete."""
-        time.sleep(self._connection_timeout)
-
-        if self._openssl_proc.poll() is not None:
-            return self._report_handshake_failure("initial connection")
-
-        time.sleep(self._handshake_delay)
-
-        if self._openssl_proc.poll() is not None:
-            return self._report_handshake_failure("handshake")
-
-        timed_print(
-            f"DTLS connection established to {self.bridge_ip}:{HueStreamProtocol.PORT}"
-        )
-        return True
-
-    def _report_handshake_failure(self, stage: str) -> bool:
-        """Report handshake failure and cleanup."""
-        if self._openssl_proc:
-            stdout, stderr = self._openssl_proc.communicate()
-            print(f"DTLS {stage} failed (exit code {self._openssl_proc.returncode})")
-            print(f"stderr: {stderr.decode()}")
-        return False
+        rid = service.get("rid")
+        if rid:
+            self._light_to_channel[rid] = channel_id
 
     def disconnect(self, bridge: "HueBridge") -> None:
-        """Close DTLS connection and deactivate streaming."""
-        self._connected = False
-        self._cleanup_openssl()
-        self._deactivate_streaming(bridge)
+        """Stop the sender, close DTLS, and deactivate streaming.
+
+        Deactivating hands the lights back to the bridge, which restores
+        their pre-stream state.
+        """
+        was_active = self._active
+        self._active = False
+        self._stop_event.set()
+        if self._sender and self._sender is not threading.current_thread():
+            self._sender.join(timeout=2)
+        self._sender = None
+        self._close_transport(notify=True)
+        self._pending_message = None
+        if was_active:
+            self._deactivate_streaming(bridge)
         timed_print("Entertainment stream disconnected")
 
-    def _cleanup_openssl(self) -> None:
-        """Clean up OpenSSL subprocess."""
-        if not self._openssl_proc:
-            return
-
-        try:
-            self._openssl_proc.stdin.close()
-            self._openssl_proc.terminate()
-            self._openssl_proc.wait(timeout=2)
-        except Exception:
-            try:
-                self._openssl_proc.kill()
-            except Exception:
-                pass
-        finally:
-            self._openssl_proc = None
+    def is_active(self) -> bool:
+        """True between connect() and disconnect(), even while reconnecting."""
+        return self._active
 
     def is_connected(self) -> bool:
-        """Check if DTLS connection is active."""
-        if self._openssl_proc:
-            return self._connected and self._openssl_proc.poll() is None
-        return self._connected
+        """True if the DTLS session to the bridge is currently up."""
+        transport = self._transport
+        return self._active and transport is not None and not transport.closed
 
     def send_colors(self, colors: Dict[int, Tuple[float, float, float, float]]) -> None:
-        """Send color update to all channels (RGB format).
+        """Queue a colour update for all channels (RGB format).
 
         Args:
             colors: Dict mapping channel_id to (r, g, b, _) tuple
                    where r, g, b are 0.0-1.0
         """
-        if not self.is_connected():
+        if not self._message_buffer:
             return
-
         with self._lock:
-            try:
-                message = self._build_rgb_message(colors)
-                self._send_dtls_message(message)
-                self._sequence = (self._sequence + 1) % 256
-            except Exception as e:
-                print(f"Error sending colors: {e}")
-                self._connected = False
+            message = self._build_rgb_message(colors)
+            self._sequence = (self._sequence + 1) % 256
+        self._pending_message = message
 
     def send_colors_xy(
         self, channel_colors: Dict[int, Tuple[Tuple[float, float], int]]
     ) -> None:
-        """Send color update using XY + brightness format.
+        """Queue a colour update using XY + brightness format.
+
+        Channels missing from ``channel_colors`` are sent as off. The sender
+        thread transmits the most recent update continuously.
 
         Args:
             channel_colors: Dict mapping channel_id to ((x, y), brightness) tuple
                            where x, y are CIE color coordinates and brightness is 0-254
         """
-        if not self.is_connected():
+        if not self._message_buffer:
             return
-
         with self._lock:
-            try:
-                message = self._build_xy_message(channel_colors)
-                self._send_dtls_message(message)
-                self._sequence = (self._sequence + 1) % 256
-            except Exception as e:
-                print(f"Error sending colors: {e}")
-                self._connected = False
-
-    def _send_dtls_message(self, message: bytes) -> None:
-        """Send a message over the DTLS connection."""
-        if self._openssl_proc:
-            self._send_via_openssl(message)
-        elif self._dtls_socket:
-            self._send_via_socket(message)
-        else:
-            raise ConnectionError("No DTLS connection available")
-
-    def _send_via_openssl(self, message: bytes) -> None:
-        """Send message via OpenSSL subprocess."""
-        try:
-            self._openssl_proc.stdin.write(message)
-            self._openssl_proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            print(f"DTLS connection lost: {e}")
-            self._connected = False
-            raise
-
-    def _send_via_socket(self, message: bytes) -> None:
-        """Send message via native DTLS socket."""
-        try:
-            self._dtls_socket.send(message)
-        except OSError as e:
-            print(f"DTLS socket error: {e}")
-            self._connected = False
-            raise
+            message = self._build_xy_message(channel_colors)
+            self._sequence = (self._sequence + 1) % 256
+        self._pending_message = message
 
     def _build_rgb_message(
         self, colors: Dict[int, Tuple[float, float, float, float]]
@@ -460,7 +468,7 @@ class EntertainmentStream:
                 channel_id,
                 int(max(0, min(1, x)) * HueStreamProtocol.MAX_16BIT),
                 int(max(0, min(1, y)) * HueStreamProtocol.MAX_16BIT),
-                max(0, min(254, brightness)) * HueStreamProtocol.BRIGHTNESS_SCALE,
+                int(max(0, min(254, brightness)) * HueStreamProtocol.BRIGHTNESS_SCALE),
             )
             offset += HueStreamProtocol.CHANNEL_DATA_SIZE
         return bytes(buf)

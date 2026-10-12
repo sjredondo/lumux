@@ -1,7 +1,7 @@
 """Settings management for Hue Sync application."""
 
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from pathlib import Path
 from typing import Optional, List
 from lumux.config.zone_mapping import ZoneMapping
@@ -31,6 +31,9 @@ class CaptureSettings:
     scale_factor: float = 0.125
     source_type: str = "screen"  # "screen" = monitor, "window" = single window
     restore_token: str = ""  # Portal restore token for persistent screen-cast consent
+    # "auto" = X11 grab on X11 sessions (e.g. SteamOS Desktop Mode), portal on
+    # Wayland; "portal" / "x11" force one backend.
+    backend: str = "auto"
 
 
 @dataclass
@@ -158,6 +161,14 @@ class SettingsManager:
 
         return ZoneMapping()
 
+    @staticmethod
+    def _known(cls, data: dict) -> dict:
+        """Drop keys a dataclass doesn't know, so one stale/unknown key in
+        settings.json doesn't make the whole file (bridge pairing included)
+        fall back to defaults."""
+        names = {f.name for f in fields(cls)}
+        return {k: v for k, v in (data or {}).items() if k in names}
+
     def _load_settings(self):
         """Load settings from config file."""
         if self._settings_file.exists():
@@ -165,15 +176,15 @@ class SettingsManager:
                 with open(self._settings_file, "r") as f:
                     data = json.load(f)
 
-                self._settings.hue = HueSettings(**data.get("hue", {}))
-                self._settings.capture = CaptureSettings(**data.get("capture", {}))
+                self._settings.hue = HueSettings(**self._known(HueSettings, data.get("hue", {})))
+                self._settings.capture = CaptureSettings(**self._known(CaptureSettings, data.get("capture", {})))
                 # Ensure we pass show_preview through when present
-                self._settings.zones = ZoneSettings(**data.get("zones", {}))
-                self._settings.sync = SyncSettings(**data.get("sync", {}))
+                self._settings.zones = ZoneSettings(**self._known(ZoneSettings, data.get("zones", {})))
+                self._settings.sync = SyncSettings(**self._known(SyncSettings, data.get("sync", {})))
                 # UI settings (optional)
-                self._settings.ui = UISettings(**data.get("ui", {}))
+                self._settings.ui = UISettings(**self._known(UISettings, data.get("ui", {})))
                 # Black bar settings (optional)
-                self._settings.black_bar = BlackBarSettings(**data.get("black_bar", {}))
+                self._settings.black_bar = BlackBarSettings(**self._known(BlackBarSettings, data.get("black_bar", {})))
                 # Reading mode settings (optional)
                 reading_data = data.get("reading_mode", {})
                 # Handle tuple serialization for color_xy
@@ -186,7 +197,9 @@ class SettingsManager:
                     reading_data["light_ids"], list
                 ):
                     reading_data["light_ids"] = []
-                self._settings.reading_mode = ReadingModeSettings(**reading_data)
+                self._settings.reading_mode = ReadingModeSettings(
+                    **self._known(ReadingModeSettings, reading_data)
+                )
             except (json.JSONDecodeError, TypeError) as e:
                 timed_print(f"Error loading settings: {e}")
                 self._validate_settings()
@@ -219,6 +232,8 @@ class SettingsManager:
         )
         if self._settings.capture.source_type not in ("screen", "window"):
             self._settings.capture.source_type = "screen"
+        if self._settings.capture.backend not in ("auto", "portal", "x11"):
+            self._settings.capture.backend = "auto"
         self._settings.sync.fps = max(1, min(60, self._settings.sync.fps))
         self._settings.sync.transition_time_ms = max(
             0, min(1000, self._settings.sync.transition_time_ms)

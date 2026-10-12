@@ -1,8 +1,23 @@
-"""Screen capture using PipeWire portal with optimized GStreamer pipeline."""
+"""Screen capture via the xdg-desktop-portal (Wayland) or X11, using GStreamer.
 
+Backends:
+
+* **portal** - org.freedesktop.portal.ScreenCast + pipewiresrc. Works on
+  Wayland compositors (GNOME, Plasma Wayland, ...).
+* **x11** - ximagesrc. Needed on X11 sessions such as SteamOS Desktop Mode,
+  where the KDE portal does not offer ScreenCast at all, so the portal path
+  never produced a single frame.
+
+Frames are *pulled* from the appsink by the sync thread at the sync rate
+rather than pushed through a Python callback on every compositor frame
+(60-144 Hz), and the appsink only keeps the newest frame.
+"""
+
+import itertools
+import os
 import re
-import time
 import threading
+import time
 from typing import Optional, List, Set, TYPE_CHECKING
 
 import numpy as np
@@ -21,22 +36,39 @@ if TYPE_CHECKING:
 
 Gst.init(None)
 
+_request_counter = itertools.count(1)
+
+
+class _PortalCancelled(Exception):
+    pass
+
 
 class ScreenCapture:
+    # After a failed/denied portal request, wait before asking again so a
+    # cancelled dialog isn't immediately re-opened every frame.
+    PORTAL_RETRY_DELAY = 10.0
+
     def __init__(
         self,
         scale_factor: float = 0.125,
         black_bar_settings: Optional["BlackBarSettings"] = None,
         source_type: str = "screen",
         restore_token: str = "",
+        backend: str = "auto",
+        max_fps: int = 30,
     ):
         self.scale_factor = scale_factor
         self.source_type = source_type
-        self._display = None
+        self.backend = backend
+        self.max_fps = max_fps
+        self.last_error: str = ""
 
         self._portal_node_id: Optional[int] = None
         self._portal_session_handle: Optional[str] = None
         self._portal_bus = None
+        self._portal_cancel = threading.Event()
+        self._portal_retry_at = 0.0
+        self._portal_unsupported = False
         # Portal restore token for persistent screen-cast consent. When set,
         # the portal can skip the permission dialog on subsequent sessions.
         self._restore_token: str = restore_token or ""
@@ -46,18 +78,16 @@ class ScreenCapture:
                 f"[capture] Loaded cached screen-share consent token "
                 f"({len(self._restore_token)} chars) — should skip prompt"
             )
-        else:
-            print("[capture] No cached consent token — permission dialog will be shown")
 
         self._pipeline: Optional[Gst.Pipeline] = None
         self._appsink: Optional[GstApp.AppSink] = None
         self._latest_frame: Optional[np.ndarray] = None
-        self._latest_frame_data: Optional[bytes] = None
-        self._frame_lock = threading.Lock()
+        self._frame_seq = 0
         self._pipeline_running = False
         self._pipeline_error_logged = False
         self._runtime_failed_configs: Set[str] = set()
         self._active_config_key: Optional[str] = None
+        self._active_backend: Optional[str] = None
 
         self._source_width: Optional[int] = None
         self._source_height: Optional[int] = None
@@ -68,7 +98,31 @@ class ScreenCapture:
         if black_bar_settings is not None:
             self._init_black_bar_detector(black_bar_settings)
 
-        self._init_display()
+    # ------------------------------------------------------------------
+    # Public state
+
+    @property
+    def frame_seq(self) -> int:
+        """Incremented each time a new frame is received."""
+        return self._frame_seq
+
+    def is_capturing(self) -> bool:
+        return self._pipeline_running
+
+    @property
+    def restore_token(self) -> str:
+        """Current portal restore token (for diagnostics)."""
+        return self._restore_token
+
+    def set_on_restore_token_changed(self, callback) -> None:
+        """Register a callback invoked when the portal issues/refreshes a
+        restore token. Signature: callback(token: str). Use it to persist the
+        token so subsequent runs can skip the permission dialog.
+        """
+        self._on_restore_token_changed = callback
+
+    # ------------------------------------------------------------------
+    # Settings
 
     def _compute_scaled_dimensions(self):
         if self._source_width and self._source_height and self.scale_factor < 1.0:
@@ -90,26 +144,17 @@ class ScreenCapture:
                 self, "_scaled_w", None
             ) or target_h != getattr(self, "_scaled_h", None)
             if scaled_changed:
-                self._restart_pipeline()
+                # Applied by the sync thread on its next capture() call
+                self._needs_pipeline_restart = True
 
-    def _stop_gst_pipeline(self) -> None:
-        if self._pipeline:
-            bus = self._pipeline.get_bus()
-            if bus:
-                bus.remove_signal_watch()
-            self._pipeline.set_state(Gst.State.NULL)
-            self._pipeline = None
-            self._appsink = None
-        self._active_config_key = None
-        self._pipeline_running = False
-        self._latest_frame = None
-        self._latest_frame_data = None
-
-    def _restart_pipeline(self) -> None:
-        self._needs_pipeline_restart = False
-        self._stop_gst_pipeline()
-        if self._portal_node_id:
-            self._start_pipeline()
+    def update_backend(self, backend: str, max_fps: int) -> None:
+        changed = backend != self.backend or (
+            self._active_backend == "x11" and max_fps != self.max_fps
+        )
+        self.backend = backend
+        self.max_fps = max_fps
+        if changed and self._pipeline_running:
+            self._needs_pipeline_restart = True
 
     def _init_black_bar_detector(self, settings: "BlackBarSettings") -> None:
         self._black_bar_detector = BlackBarDetector(
@@ -133,25 +178,42 @@ class ScreenCapture:
             return None
         return self._black_bar_detector.get_crop_region()
 
-    def _init_display(self):
-        try:
-            from gi.repository import Gdk
+    # ------------------------------------------------------------------
+    # Backend selection
 
-            self._display = Gdk.Display.get_default()
-        except Exception as e:
-            print(f"Error initializing display: {e}")
+    @staticmethod
+    def _is_x11_session() -> bool:
+        session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        if session == "x11":
+            return True
+        if session == "wayland":
+            return False
+        return bool(os.environ.get("DISPLAY")) and not os.environ.get("WAYLAND_DISPLAY")
 
-    @property
-    def restore_token(self) -> str:
-        """Current portal restore token (for diagnostics)."""
-        return self._restore_token
+    @staticmethod
+    def _x11_available() -> bool:
+        return bool(os.environ.get("DISPLAY")) and (
+            Gst.ElementFactory.find("ximagesrc") is not None
+        )
 
-    def set_on_restore_token_changed(self, callback) -> None:
-        """Register a callback invoked when the portal issues/refreshes a
-        restore token. Signature: callback(token: str). Use it to persist the
-        token so subsequent runs can skip the permission dialog.
-        """
-        self._on_restore_token_changed = callback
+    def _choose_backend(self) -> str:
+        if self.backend in ("portal", "x11"):
+            return self.backend
+        if (self._is_x11_session() or self._portal_unsupported) and self._x11_available():
+            return "x11"
+        return "portal"
+
+    # ------------------------------------------------------------------
+    # Frame acquisition (called from the sync thread)
+
+    def poll(self) -> bool:
+        """Fetch the newest frame if one arrived. Returns True if new."""
+        if not self._pipeline_running:
+            return False
+        self._drain_bus()
+        if not self._pipeline_running:
+            return False
+        return self._pull_sample(0)
 
     def capture(self) -> Optional[np.ndarray]:
         if self._needs_pipeline_restart and self._pipeline_running:
@@ -160,46 +222,73 @@ class ScreenCapture:
                 return None
 
         if self._pipeline_running:
-            with self._frame_lock:
-                frame = self._latest_frame
-            if frame is not None:
-                return self._process_image(frame)
+            self.poll()
+            if self._latest_frame is not None:
+                return self._process_image(self._latest_frame)
 
-        if not self._portal_node_id:
-            if not self._setup_portal_session():
-                # A stale restore token (e.g. after a monitor/source change)
-                # can make session setup fail silently. Retry once without it
-                # so the portal shows a fresh permission dialog.
-                if self._restore_token:
-                    print(
-                        "[capture] Cached consent token was rejected by portal "
-                        "(stale or revoked) — clearing cache and re-prompting"
-                    )
-                    self._restore_token = ""
-                    if self._on_restore_token_changed:
-                        try:
-                            self._on_restore_token_changed("")
-                        except Exception as e:
-                            print(f"Error clearing restore token: {e}")
-                    if not self._setup_portal_session():
-                        return None
-                else:
-                    return None
+        if not self._pipeline_running and not self._ensure_source():
+            return None
 
         if not self._pipeline_running:
             if not self._start_pipeline():
                 return None
 
-        timeout = 2.0
-        start = time.time()
-        while (time.time() - start) < timeout:
-            with self._frame_lock:
-                frame = self._latest_frame
-            if frame is not None:
-                return self._process_image(frame)
-            time.sleep(0.01)
-
+        # Wait for the first frame (a static screen may only send one)
+        deadline = time.monotonic() + 2.0
+        while self._pipeline_running and time.monotonic() < deadline:
+            self._drain_bus()
+            if self._pull_sample(0.1) or self._latest_frame is not None:
+                return self._process_image(self._latest_frame)
         return None
+
+    def _ensure_source(self) -> bool:
+        """Make sure we have something to capture from."""
+        backend = self._choose_backend()
+        if backend == "x11":
+            if not self._x11_available():
+                self.last_error = "X11 capture unavailable (no DISPLAY or ximagesrc)"
+                return False
+            self._active_backend = "x11"
+            return True
+
+        self._active_backend = "portal"
+        if self._portal_node_id:
+            return True
+        if time.monotonic() < self._portal_retry_at:
+            return False
+        ok = self._setup_portal_session()
+        if not ok and self._restore_token and not self._portal_cancel.is_set():
+            # A stale restore token (e.g. after a monitor/source change)
+            # can make session setup fail silently. Retry once without it
+            # so the portal shows a fresh permission dialog.
+            print(
+                "[capture] Cached consent token was rejected by portal "
+                "(stale or revoked) — clearing cache and re-prompting"
+            )
+            self._set_restore_token("")
+            ok = self._setup_portal_session()
+        if not ok:
+            self._portal_retry_at = time.monotonic() + self.PORTAL_RETRY_DELAY
+            # Portal has no ScreenCast (e.g. KDE on X11): fall back to X11
+            if self._portal_unsupported and self.backend == "auto" and self._x11_available():
+                print("[capture] Portal capture unavailable; falling back to X11 capture")
+                self._active_backend = "x11"
+                return True
+        return ok
+
+    def _pull_sample(self, timeout_s: float) -> bool:
+        appsink = self._appsink
+        if appsink is None:
+            return False
+        sample = appsink.try_pull_sample(int(timeout_s * Gst.SECOND))
+        if sample is None:
+            return False
+        frame = self._sample_to_frame(sample)
+        if frame is None:
+            return False
+        self._latest_frame = frame
+        self._frame_seq += 1
+        return True
 
     def _process_image(self, screen: np.ndarray) -> np.ndarray:
         if screen is None or screen.size == 0:
@@ -236,7 +325,83 @@ class ScreenCapture:
             )
         return screen
 
+    # ------------------------------------------------------------------
+    # Portal session
+
+    def _set_restore_token(self, token: str) -> None:
+        if token == self._restore_token:
+            return
+        self._restore_token = token
+        if self._on_restore_token_changed:
+            try:
+                self._on_restore_token_changed(token)
+            except Exception as e:
+                print(f"Error persisting restore token: {e}")
+
+    def _portal_request(self, ctx, bus, call, options: dict, timeout_s: float) -> dict:
+        """Invoke a portal method and wait for its Request::Response.
+
+        Subscribes *before* calling (using a predictable handle_token) so a
+        fast response can't be missed, and waits on a private main context
+        so this worker thread never iterates GTK's default context.
+        """
+        token = f"lumux{os.getpid()}_{next(_request_counter)}"
+        options["handle_token"] = GLib.Variant("s", token)
+        sender = bus.con.get_unique_name().lstrip(":").replace(".", "_")
+        path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+
+        loop = GLib.MainLoop(ctx)
+        state = {"code": None, "results": {}}
+
+        def on_response(_conn, _sender, _obj, _iface, _signal, params):
+            code, results = params.unpack()
+            state["code"] = code
+            state["results"] = results
+            loop.quit()
+
+        sub = bus.con.signal_subscribe(
+            None,
+            "org.freedesktop.portal.Request",
+            "Response",
+            path,
+            None,
+            0,
+            on_response,
+        )
+        deadline = time.monotonic() + timeout_s
+
+        def tick():
+            if self._portal_cancel.is_set() or time.monotonic() > deadline:
+                loop.quit()
+                return False
+            return True
+
+        timer = GLib.timeout_source_new(100)
+        timer.set_callback(tick)
+        timer.attach(ctx)
+        try:
+            call(options)
+            if state["code"] is None:
+                loop.run()
+        finally:
+            timer.destroy()
+            bus.con.signal_unsubscribe(sub)
+
+        if self._portal_cancel.is_set():
+            raise _PortalCancelled()
+        if state["code"] is None:
+            raise TimeoutError("portal did not respond")
+        if state["code"] != 0:
+            raise PermissionError(
+                "screen sharing was cancelled" if state["code"] == 1 else
+                f"portal request failed (code {state['code']})"
+            )
+        return state["results"]
+
     def _setup_portal_session(self) -> bool:
+        self._portal_cancel.clear()
+        ctx = GLib.MainContext.new()
+        ctx.push_thread_default()
         try:
             import pydbus
 
@@ -247,34 +412,16 @@ class ScreenCapture:
             portal = bus.get(
                 "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop"
             )
-            screencast = portal["org.freedesktop.portal.ScreenCast"]
-
-            loop = GLib.MainLoop()
-            state = {
-                "session_handle": None,
-                "node_id": None,
-                "restore_token": None,
-                "error": None,
-            }
-
-            def on_response(connection, sender, object, interface, signal, params):
-                code, results = params
-                if code != 0:
-                    state["error"] = code
-                    loop.quit()
-                    return
-
-                if "session_handle" in results:
-                    state["session_handle"] = results["session_handle"]
-                    loop.quit()
-                elif "streams" in results:
-                    state["node_id"] = results["streams"][0][0]
-                    # The Start response may carry a restore_token when
-                    # persistent consent was granted; persist it for next time.
-                    state["restore_token"] = results.get("restore_token", "")
-                    loop.quit()
-                else:
-                    loop.quit()
+            try:
+                screencast = portal["org.freedesktop.portal.ScreenCast"]
+            except KeyError:
+                self._portal_unsupported = True
+                self.last_error = (
+                    "Desktop portal has no ScreenCast support "
+                    "(X11 session?) — use the X11 capture method"
+                )
+                print(f"[capture] {self.last_error}")
+                return False
 
             token = str(int(time.time()))
             create_options = {
@@ -289,108 +436,92 @@ class ScreenCapture:
                 create_options["restore_token"] = GLib.Variant(
                     "s", self._restore_token
                 )
-                print(
-                    "[capture] Restoring cached screen-share consent "
-                    f"(token length {len(self._restore_token)}) — "
-                    "dialog should be skipped"
-                )
-            else:
-                print(
-                    "[capture] Requesting fresh screen-share consent "
-                    "(persist_mode=2) — dialog will be shown once"
-                )
-            req = screencast.CreateSession(create_options)
-            sub = bus.con.signal_subscribe(
-                None,
-                "org.freedesktop.portal.Request",
-                "Response",
-                req,
-                None,
-                0,
-                on_response,
-            )
-            GLib.timeout_add_seconds(30, loop.quit)
-            try:
-                loop.run()
-            finally:
-                bus.con.signal_unsubscribe(sub)
 
-            if not state["session_handle"]:
+            results = self._portal_request(
+                ctx, bus, lambda o: screencast.CreateSession(o), create_options, 30
+            )
+            session_handle = results.get("session_handle")
+            if not session_handle:
                 return False
-            self._portal_session_handle = state["session_handle"]
+            self._portal_session_handle = session_handle
 
             portal_types = 1 if self.source_type == "screen" else 2
-            loop = GLib.MainLoop()
-            req = screencast.SelectSources(
-                self._portal_session_handle,
-                {
-                    "types": GLib.Variant("u", portal_types),
-                    "multiple": GLib.Variant("b", False),
-                },
+            select_options = {
+                "types": GLib.Variant("u", portal_types),
+                "multiple": GLib.Variant("b", False),
+                "persist_mode": GLib.Variant("u", 2),
+            }
+            if self._restore_token:
+                select_options["restore_token"] = GLib.Variant("s", self._restore_token)
+            self._portal_request(
+                ctx,
+                bus,
+                lambda o: screencast.SelectSources(session_handle, o),
+                select_options,
+                30,
             )
-            sub = bus.con.signal_subscribe(
-                None,
-                "org.freedesktop.portal.Request",
-                "Response",
-                req,
-                None,
-                0,
-                on_response,
+
+            # Start shows the consent dialog; give the user time to answer
+            results = self._portal_request(
+                ctx, bus, lambda o: screencast.Start(session_handle, "", o), {}, 180
             )
-            try:
-                loop.run()
-            finally:
-                bus.con.signal_unsubscribe(sub)
+            streams = results.get("streams") or []
+            if not streams:
+                return False
 
-            loop = GLib.MainLoop()
-            req = screencast.Start(self._portal_session_handle, "", {})
-            sub = bus.con.signal_subscribe(
-                None,
-                "org.freedesktop.portal.Request",
-                "Response",
-                req,
-                None,
-                0,
-                on_response,
-            )
-            try:
-                loop.run()
-            finally:
-                bus.con.signal_unsubscribe(sub)
+            self._portal_node_id = streams[0][0]
+            self.last_error = ""
+            print(f"Portal session started. PipeWire node: {self._portal_node_id}")
+            new_token = results.get("restore_token") or ""
+            if not new_token:
+                print(
+                    "[capture] Portal did NOT issue a consent token — "
+                    "the prompt will recur each sync"
+                )
+            self._set_restore_token(new_token)
+            return True
 
-            if state["node_id"]:
-                self._portal_node_id = state["node_id"]
-                print(f"Portal session started. PipeWire node: {self._portal_node_id}")
-                # Persist/refresh the restore token if the portal granted one.
-                new_token = state.get("restore_token") or ""
-                if new_token:
-                    print(
-                        f"[capture] Screen-share consent cached "
-                        f"(token length {len(new_token)}) — "
-                        "will skip prompt on next sync"
-                    )
-                else:
-                    print(
-                        "[capture] Portal did NOT issue a consent token — "
-                        "host does not support persisting screen-share consent "
-                        "(needs GNOME 47+ / Plasma 6.x), so the prompt will "
-                        "recur each sync"
-                    )
-                if new_token != self._restore_token:
-                    self._restore_token = new_token
-                    if self._on_restore_token_changed:
-                        try:
-                            self._on_restore_token_changed(new_token)
-                        except Exception as e:
-                            print(f"Error persisting restore token: {e}")
-                return True
-
+        except _PortalCancelled:
+            print("[capture] Portal request cancelled")
         except Exception as e:
+            self.last_error = f"Screen capture setup failed: {e}"
             print(f"Failed to setup portal session: {e}")
+        finally:
+            ctx.pop_thread_default()
 
+        self._close_portal_session()
         return False
 
-    def _get_pipeline_configs(self, node_id: int) -> List[str]:
+    def _close_portal_session(self):
+        if self._portal_session_handle and self._portal_bus:
+            try:
+                session = self._portal_bus.get(
+                    "org.freedesktop.portal.Desktop",
+                    self._portal_session_handle,
+                )
+                session.Close()
+                print("Portal session closed")
+            except Exception as e:
+                print(f"Error closing portal session (may already be closed): {e}")
+        self._portal_session_handle = None
+        self._portal_bus = None
+
+    # ------------------------------------------------------------------
+    # GStreamer pipeline
+
+    def _source_element(self) -> Optional[str]:
+        if self._active_backend == "x11":
+            fps = max(1, min(60, int(self.max_fps or 30)))
+            # framerate caps make ximagesrc grab only as often as we sync
+            return (
+                "ximagesrc use-damage=false show-pointer=false ! "
+                f"video/x-raw,framerate={fps}/1"
+            )
+        if self._portal_node_id:
+            return f"pipewiresrc path={self._portal_node_id} do-timestamp=true"
+        return None
+
+    def _get_pipeline_configs(self, src: str) -> List[str]:
         configs = []
 
         target_w, target_h = self._compute_scaled_dimensions()
@@ -403,13 +534,21 @@ class ScreenCapture:
         has_v4l2convert = Gst.ElementFactory.find("v4l2convert") is not None
         has_videoconvert = Gst.ElementFactory.find("videoconvert") is not None
 
-        sink_props = "name=sink emit-signals=true drop=true max-buffers=1 sync=false"
-        src = f"pipewiresrc path={node_id} do-timestamp=true"
+        # No signals: the sync thread pulls the newest frame itself
+        sink_props = "name=sink emit-signals=false drop=true max-buffers=1 sync=false"
+        use_gl = self._active_backend != "x11"  # X11 frames are already in RAM
 
         if target_w and target_h:
             scaled_caps = f"video/x-raw,format=RGB,width={target_w},height={target_h}"
 
-            if has_glupload and has_glcolorconvert and has_gldownload:
+            if self._active_backend == "x11" and has_videoscale and has_videoconvert:
+                # Scale first so colour conversion runs on the small frame
+                configs.append(
+                    f"{src} ! videoscale ! videoconvert ! {scaled_caps} ! "
+                    f"appsink {sink_props}"
+                )
+
+            if use_gl and has_glupload and has_glcolorconvert and has_gldownload:
                 if has_glcolorscale:
                     configs.append(
                         f"{src} ! "
@@ -424,7 +563,7 @@ class ScreenCapture:
                         f"{scaled_caps} ! appsink {sink_props}"
                     )
 
-            if has_v4l2convert and has_videoscale:
+            if use_gl and has_v4l2convert and has_videoscale:
                 configs.append(
                     f"{src} ! v4l2convert ! videoscale ! {scaled_caps} ! "
                     f"appsink {sink_props}"
@@ -436,7 +575,7 @@ class ScreenCapture:
                     f"appsink {sink_props}"
                 )
 
-        if has_glupload and has_glcolorconvert and has_gldownload:
+        if use_gl and has_glupload and has_glcolorconvert and has_gldownload:
             configs.append(
                 f"{src} ! "
                 f"glupload ! glcolorconvert ! gldownload ! "
@@ -444,7 +583,7 @@ class ScreenCapture:
                 f"appsink {sink_props}"
             )
 
-        if has_glupload and has_glcolorscale and has_gldownload:
+        if use_gl and has_glupload and has_glcolorscale and has_gldownload:
             configs.append(
                 f"{src} ! "
                 f"glupload ! glcolorscale ! gldownload ! "
@@ -452,7 +591,7 @@ class ScreenCapture:
                 f"appsink {sink_props}"
             )
 
-        if has_v4l2convert:
+        if use_gl and has_v4l2convert:
             configs.append(
                 f"{src} ! v4l2convert ! video/x-raw,format=RGB ! appsink {sink_props}"
             )
@@ -471,16 +610,23 @@ class ScreenCapture:
         key = re.sub(r"path=\d+", "path=*", pipeline_str)
         key = re.sub(r"width=\d+", "width=*", key)
         key = re.sub(r"height=\d+", "height=*", key)
+        key = re.sub(r"framerate=\d+/1", "framerate=*", key)
         return key
 
+    @staticmethod
+    def _describe(pipeline_str: str) -> str:
+        parts = [p.strip().split(" ")[0] for p in pipeline_str.split(" ! ")]
+        return " ! ".join(p for p in parts if not p.startswith("video/"))
+
     def _start_pipeline(self) -> bool:
-        if not self._portal_node_id:
+        src = self._source_element()
+        if not src:
             return False
 
         if self._pipeline:
             self._stop_gst_pipeline()
 
-        configs = self._get_pipeline_configs(self._portal_node_id)
+        configs = self._get_pipeline_configs(src)
         if not configs:
             print("No suitable GStreamer pipeline configuration found")
             print("Need one of: glupload+glcolorconvert, v4l2convert, or videoconvert")
@@ -496,24 +642,13 @@ class ScreenCapture:
             try:
                 self._pipeline = Gst.parse_launch(pipeline_str)
                 self._appsink = self._pipeline.get_by_name("sink")
-                self._appsink.connect("new-sample", self._on_new_sample)
-
-                bus = self._pipeline.get_bus()
-                bus.add_signal_watch()
-                bus.connect("message::error", self._on_pipeline_error)
-                bus.connect("message::warning", self._on_pipeline_warning)
-                bus.connect("message::element", self._on_pipeline_element_message)
 
                 ret = self._pipeline.set_state(Gst.State.PLAYING)
                 if ret == Gst.StateChangeReturn.FAILURE:
-                    desc = (
-                        pipeline_str.split(" ! ")[1]
-                        if " ! " in pipeline_str
-                        else "unknown"
-                    )
-                    print(f"Pipeline config {i + 1} failed (converter: {desc})")
+                    print(f"Pipeline config {i + 1} failed ({self._describe(pipeline_str)})")
                     self._pipeline.set_state(Gst.State.NULL)
                     self._pipeline = None
+                    self._appsink = None
                     continue
 
                 uses_scaled_caps = (
@@ -526,14 +661,12 @@ class ScreenCapture:
                 self._pipeline_running = True
                 self._pipeline_error_logged = False
                 self._active_config_key = config_key
-                desc = (
-                    pipeline_str.split(" ! ")[1] if " ! " in pipeline_str else "unknown"
-                )
                 scale_info = (
                     f", scaled to {target_w}x{target_h}" if uses_scaled_caps else ""
                 )
                 print(
-                    f"GStreamer capture pipeline started (converter: {desc}{scale_info})"
+                    f"GStreamer capture pipeline started "
+                    f"({self._describe(pipeline_str)}{scale_info})"
                 )
                 return True
 
@@ -542,97 +675,125 @@ class ScreenCapture:
                 if self._pipeline:
                     self._pipeline.set_state(Gst.State.NULL)
                     self._pipeline = None
+                    self._appsink = None
                 continue
 
         self._pipeline_scaled = False
+        self.last_error = "All capture pipeline configurations failed"
         print("All pipeline configurations failed")
         self._log_pipeline_details()
         return False
 
-    def _on_pipeline_error(self, bus, message):
-        err, debug = message.parse_error()
-        if not self._pipeline_error_logged:
-            print(f"GStreamer pipeline error: {err.message}")
-            print(f"GStreamer debug info: {debug}")
-            self._pipeline_error_logged = True
-        if self._active_config_key:
-            self._runtime_failed_configs.add(self._active_config_key)
-            print(
-                "Marking pipeline config as failed; "
-                "will fall back to next converter on restart"
-            )
+    def _drain_bus(self) -> None:
+        """Handle pipeline errors/warnings on the sync thread (no main-loop
+        signal watch, so GStreamer state is only touched from one thread)."""
+        pipeline = self._pipeline
+        if pipeline is None:
+            return
+        bus = pipeline.get_bus()
+        mask = Gst.MessageType.ERROR | Gst.MessageType.WARNING | Gst.MessageType.ELEMENT
+        while True:
+            message = bus.pop_filtered(mask)
+            if message is None:
+                return
+            if message.type == Gst.MessageType.ERROR:
+                err, debug = message.parse_error()
+                if not self._pipeline_error_logged:
+                    print(f"GStreamer pipeline error: {err.message}")
+                    print(f"GStreamer debug info: {debug}")
+                    self._pipeline_error_logged = True
+                if self._active_config_key:
+                    self._runtime_failed_configs.add(self._active_config_key)
+                    print(
+                        "Marking pipeline config as failed; "
+                        "will fall back to next converter on restart"
+                    )
+                self._stop_gst_pipeline()
+                return
+            if message.type == Gst.MessageType.WARNING:
+                warn, _debug = message.parse_warning()
+                print(f"GStreamer pipeline warning: {warn.message}")
+            else:
+                structure = message.get_structure()
+                if structure and structure.get_name() == "missing-plugin":
+                    print(f"Missing GStreamer plugin: {structure.to_string()}")
+
+    def _stop_gst_pipeline(self) -> None:
+        if self._pipeline:
+            self._pipeline.set_state(Gst.State.NULL)
+            self._pipeline = None
+            self._appsink = None
+        self._active_config_key = None
+        self._pipeline_running = False
+        self._latest_frame = None
+
+    def _restart_pipeline(self) -> None:
+        self._needs_pipeline_restart = False
         self._stop_gst_pipeline()
-
-    def _on_pipeline_warning(self, bus, message):
-        warn, debug = message.parse_warning()
-        print(f"GStreamer pipeline warning: {warn.message}")
-
-    def _on_pipeline_element_message(self, bus, message):
-        structure = message.get_structure()
-        if structure and structure.get_name() == "missing-plugin":
-            print(f"Missing GStreamer plugin: {structure.to_string()}")
+        if self._active_backend != self._choose_backend():
+            # Capture method changed in settings: re-acquire the source
+            self.stop_pipeline()
+            return
+        self._start_pipeline()
 
     def _log_pipeline_details(self):
-        if not self._pipeline:
-            return
         try:
-            state = self._pipeline.get_state(Gst.CLOCK_TIME_NONE)
-            print(f"Pipeline state: {state}")
-            print(f"PipeWire node ID: {self._portal_node_id}")
+            print(f"Capture backend: {self._active_backend}, PipeWire node: {self._portal_node_id}")
             plugins = {
-                "pipewiresrc": Gst.ElementFactory.find("pipewiresrc") is not None,
-                "videoconvert": Gst.ElementFactory.find("videoconvert") is not None,
-                "videoscale": Gst.ElementFactory.find("videoscale") is not None,
-                "v4l2convert": Gst.ElementFactory.find("v4l2convert") is not None,
-                "glupload": Gst.ElementFactory.find("glupload") is not None,
-                "glcolorconvert": Gst.ElementFactory.find("glcolorconvert") is not None,
-                "gldownload": Gst.ElementFactory.find("gldownload") is not None,
-                "glcolorscale": Gst.ElementFactory.find("glcolorscale") is not None,
+                name: Gst.ElementFactory.find(name) is not None
+                for name in (
+                    "pipewiresrc",
+                    "ximagesrc",
+                    "videoconvert",
+                    "videoscale",
+                    "v4l2convert",
+                    "glupload",
+                    "glcolorconvert",
+                    "gldownload",
+                    "glcolorscale",
+                )
             }
             print(f"GStreamer plugins: {plugins}")
         except Exception as e:
             print(f"Error logging pipeline details: {e}")
 
+    # ------------------------------------------------------------------
+    # Sample conversion
+
     @staticmethod
     def _extract_pixel_rows(
-        data: bytes, width: int, height: int, bpp: int, stride: Optional[int]
+        data, width: int, height: int, bpp: int, stride: Optional[int]
     ) -> np.ndarray:
         """Return a (height, width*bpp) uint8 array, stripping row padding.
 
         GStreamer may pad each row to an alignment boundary (e.g. 4 bytes),
         so the buffer stride can exceed width*bpp. The real stride comes from
         GstVideoMeta when available, otherwise it is inferred from the buffer
-        size.
+        size. The result may be a view of ``data``; callers copy it.
         """
+        arr = np.frombuffer(data, dtype=np.uint8)
         row_bytes = width * bpp
         if not stride or stride < row_bytes:
-            if len(data) == height * row_bytes:
+            if arr.size == height * row_bytes:
                 stride = row_bytes
             else:
-                stride = len(data) // height if height else row_bytes
-        if stride < row_bytes or len(data) < stride * (height - 1) + row_bytes:
+                stride = arr.size // height if height else row_bytes
+        if stride < row_bytes or arr.size < stride * (height - 1) + row_bytes:
             raise ValueError(
-                f"Buffer too small: {len(data)} bytes for "
+                f"Buffer too small: {arr.size} bytes for "
                 f"{width}x{height} with bpp={bpp} (stride={stride})"
             )
 
-        arr = np.frombuffer(data, dtype=np.uint8)
         if stride == row_bytes:
             return arr[: height * row_bytes].reshape(height, row_bytes)
 
-        # Padded rows: build a strided view (handles a possibly unpadded
-        # final row) and copy to detach from the mapped buffer.
-        rows = np.lib.stride_tricks.as_strided(
+        # Padded rows: strided view (handles a possibly unpadded final row)
+        return np.lib.stride_tricks.as_strided(
             arr, shape=(height, row_bytes), strides=(stride, 1)
         )
-        return rows.copy()
 
-    def _on_new_sample(self, appsink) -> Gst.FlowReturn:
+    def _sample_to_frame(self, sample) -> Optional[np.ndarray]:
         try:
-            sample = appsink.emit("pull-sample")
-            if not sample:
-                return Gst.FlowReturn.OK
-
             buffer = sample.get_buffer()
             caps = sample.get_caps()
 
@@ -662,11 +823,9 @@ class ScreenCapture:
                 print(f"Failed to map buffer (format={fmt}, {width}x{height})")
                 print("This likely means DMA-BUF buffers are being received.")
                 print("Ensure GStreamer GL plugins (gst-plugins-gl) are installed.")
-                return Gst.FlowReturn.OK
+                return None
 
             try:
-                data = bytes(map_info.data)
-
                 if fmt in ("RGBA", "RGBx", "BGRA", "BGRx"):
                     bpp = 4
                 elif fmt in ("BGR15", "RGB15"):
@@ -674,52 +833,39 @@ class ScreenCapture:
                 else:
                     bpp = 3
 
-                rows = self._extract_pixel_rows(data, width, height, bpp, stride)
+                rows = self._extract_pixel_rows(map_info.data, width, height, bpp, stride)
 
+                # Every branch produces a fresh array: the mapped memory is
+                # released right after this block.
                 if fmt == "BGR":
-                    frame = rows.reshape(height, width, 3)[:, :, ::-1].copy()
-                elif fmt in ("RGBA", "RGBx"):
-                    frame = rows.reshape(height, width, 4)
-                elif fmt in ("BGRA", "BGRx"):
-                    frame = rows.reshape(height, width, 4)[:, :, [2, 1, 0, 3]].copy()
-                elif fmt in ("BGR15", "RGB15"):
+                    return rows.reshape(height, width, 3)[:, :, ::-1].copy()
+                if fmt in ("RGBA", "RGBx"):
+                    return rows.reshape(height, width, 4)[:, :, :3].copy()
+                if fmt in ("BGRA", "BGRx"):
+                    return rows.reshape(height, width, 4)[:, :, 2::-1].copy()
+                if fmt in ("BGR15", "RGB15"):
                     arr = np.ascontiguousarray(rows).view(np.uint16).reshape(
                         (height, width)
                     )
                     r = ((arr >> 10) & 0x1F).astype(np.uint8) * 255 // 31
                     g = ((arr >> 5) & 0x1F).astype(np.uint8) * 255 // 31
                     b = (arr & 0x1F).astype(np.uint8) * 255 // 31
-                    frame = np.stack([r, g, b], axis=2)
-                else:
-                    # RGB and unknown formats assumed 3 bytes per pixel
-                    frame = rows.reshape(height, width, 3)
-
-                with self._frame_lock:
-                    self._latest_frame = frame
-                    self._latest_frame_data = data
-
+                    return np.stack([r, g, b], axis=2)
+                # RGB and unknown formats assumed 3 bytes per pixel
+                return rows.reshape(height, width, 3).copy()
             finally:
                 buffer.unmap(map_info)
 
-            return Gst.FlowReturn.OK
-
         except Exception as e:
             print(f"Error processing frame: {e}")
-            return Gst.FlowReturn.OK
+            return None
 
-    def _close_portal_session(self):
-        if self._portal_session_handle and self._portal_bus:
-            try:
-                session = self._portal_bus.get(
-                    "org.freedesktop.portal.Desktop",
-                    self._portal_session_handle,
-                )
-                session.Close()
-                print("Portal session closed")
-            except Exception as e:
-                print(f"Error closing portal session (may already be closed): {e}")
-        self._portal_session_handle = None
-        self._portal_bus = None
+    # ------------------------------------------------------------------
+    # Teardown
+
+    def cancel_pending(self) -> None:
+        """Abort a portal dialog wait (thread-safe)."""
+        self._portal_cancel.set()
 
     def stop_pipeline(self):
         self._stop_gst_pipeline()
@@ -728,9 +874,15 @@ class ScreenCapture:
         self._pipeline_scaled = False
         self._needs_pipeline_restart = False
         self._portal_node_id = None
+        self._portal_retry_at = 0.0
+        self._active_backend = None
+        self._portal_unsupported = False
         self._runtime_failed_configs.clear()
         print("GStreamer pipeline stopped")
         self._close_portal_session()
 
     def __del__(self):
-        self.stop_pipeline()
+        try:
+            self.stop_pipeline()
+        except Exception:
+            pass

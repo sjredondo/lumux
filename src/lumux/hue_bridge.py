@@ -36,6 +36,17 @@ class HueBridge:
         self.lights: Dict[str, dict] = {}
         self.zones: Dict[str, dict] = {}
         self.light_info: Dict[str, dict] = {}
+        # entertainment_config_id -> light rids in that area
+        self._area_light_cache: Dict[str, List[str]] = {}
+
+    def update_credentials(self, bridge_ip: str, app_key: str) -> None:
+        """Point at a (possibly) different bridge/app key, dropping stale state."""
+        if (self.bridge_ip, self.app_key) == (bridge_ip, app_key):
+            return
+        self.bridge_ip = bridge_ip
+        self.app_key = app_key
+        self._client = None
+        self._area_light_cache.clear()
 
     @property
     def client(self) -> Optional[BridgeClient]:
@@ -120,6 +131,7 @@ class HueBridge:
             # Fetch zones
             zones = self.client.get_zones()
             self.zones = {zone.get('id'): zone for zone in zones if zone.get('id')}
+            self._area_light_cache.clear()
 
         except BridgeError as e:
             print(f"Error refreshing devices: {e}")
@@ -518,7 +530,7 @@ class HueBridge:
             print(f"Error fetching entertainment configuration: {e}")
         return None
 
-    def get_entertainment_light_ids(self, config_id: str) -> List[str]:
+    def get_entertainment_light_ids(self, config_id: str, use_cache: bool = True) -> List[str]:
         """Return the light RIDs that belong to an entertainment configuration.
 
         Entertainment configurations reference fixtures via entertainment
@@ -529,6 +541,8 @@ class HueBridge:
         """
         if not self.client or not config_id:
             return []
+        if use_cache and config_id in self._area_light_cache:
+            return list(self._area_light_cache[config_id])
 
         try:
             config = self.client.get_entertainment_configuration(config_id)
@@ -569,6 +583,8 @@ class HueBridge:
                         seen.add(lid)
                         light_ids.append(lid)
 
+            if light_ids:
+                self._area_light_cache[config_id] = list(light_ids)
             return light_ids
         except BridgeError as e:
             print(f"Error resolving entertainment light IDs: {e}")

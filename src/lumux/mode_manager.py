@@ -8,6 +8,7 @@ These modes are mutually exclusive - entertainment streaming
 must be stopped before using REST API control.
 """
 
+import threading
 import time
 from enum import Enum, auto
 from typing import Optional, Tuple, Callable
@@ -57,6 +58,7 @@ class ModeManager:
         
         # Track pending reading mode activation to prevent duplicate calls
         self._reading_activation_pending = False
+        self._video_connecting = False
     
     def set_mode_changed_callback(self, callback: Callable[[Mode], None]):
         """Set callback to be called when mode changes."""
@@ -75,61 +77,85 @@ class ModeManager:
                 self._reading_controller.set_target_lights(self.reading_settings.light_ids)
         return self._reading_controller
     
-    def switch_to_video(self) -> bool:
+    def set_entertainment(self, stream: Optional[EntertainmentStream], config_id: str):
+        """Swap in a new stream/area after settings change (e.g. re-pairing)."""
+        self.entertainment_stream = stream
+        self._entertainment_config_id = config_id
+        if self._reading_controller is not None:
+            self._reading_controller.set_entertainment_config_id(config_id)
+
+    def switch_to_video(self, callback: Optional[Callable[[bool], None]] = None) -> bool:
         """Switch to video sync mode.
-        
+
         Steps:
-        1. Stop reading mode (leave lights as-is or dim)
-        2. Deactivate any active entertainment streaming
-        3. Activate entertainment configuration
-        4. Start DTLS connection
-        5. Start sync controller
-        
-        Returns:
-            True if successfully switched to video mode
+        1. Stop reading mode (leave lights as-is)
+        2. Activate the entertainment area + DTLS handshake
+        3. Start sync controller
+
+        With ``callback`` (GUI use) step 2 runs on a worker thread so the
+        window doesn't freeze during REST calls and the handshake; the
+        callback receives the result on the GLib main loop. Without it the
+        call blocks and returns the result.
         """
         timed_print("ModeManager: Switching to VIDEO mode")
-        
-        # Step 1: Stop reading mode if active
+
         if self.current_mode == Mode.READING and self._reading_controller:
             timed_print("ModeManager: Stopping reading mode")
             # Don't turn off lights - leave them for smooth transition
             self._reading_controller.deactivate(turn_off=False)
-        
-        # Step 2: Stop sync if running (shouldn't happen but safety check)
+
         if self.sync_controller.is_running():
             timed_print("ModeManager: Stopping existing sync")
             self.sync_controller.stop()
-        
-        # Step 3: Ensure entertainment stream is ready
-        if not self.entertainment_stream:
+
+        stream = self.entertainment_stream
+        if not stream:
             timed_print("ModeManager: No entertainment stream configured")
+            if callback:
+                callback(False)
             return False
-        
-        # Step 4: Activate entertainment streaming
-        if not self.entertainment_stream.is_connected():
-            if not self.bridge.activate_entertainment_streaming(
-                self.entertainment_stream.entertainment_config_id
-            ):
-                timed_print("ModeManager: Failed to activate entertainment streaming")
+        if self._video_connecting:
+            timed_print("ModeManager: Video connection already in progress")
+            return True
+        self._video_connecting = True
+
+        def connect() -> bool:
+            # connect() activates the area itself; activating here too used to
+            # double the REST round-trips.
+            if stream.is_active():
+                return True
+            if not stream.connect(self.bridge):
+                timed_print(f"ModeManager: Failed to connect entertainment stream: {stream.last_error}")
                 return False
-            
-            # Connect DTLS
-            if not self.entertainment_stream.connect(self.bridge):
-                timed_print("ModeManager: Failed to connect DTLS")
-                self.bridge.deactivate_entertainment_streaming(
-                    self.entertainment_stream.entertainment_config_id
-                )
-                return False
-        
-        # Step 5: Start video sync
-        self.sync_controller.start()
-        
-        self.current_mode = Mode.VIDEO
-        self._notify_mode_changed()
-        timed_print("ModeManager: Now in VIDEO mode")
+            return True
+
+        def finish(ok: bool) -> bool:
+            self._video_connecting = False
+            if ok and stream is self.entertainment_stream:
+                self.sync_controller.start()
+                self.current_mode = Mode.VIDEO
+                self._notify_mode_changed()
+                timed_print("ModeManager: Now in VIDEO mode")
+            elif ok:
+                # Settings swapped the stream while we were connecting
+                stream.disconnect(self.bridge)
+                ok = False
+            if callback:
+                callback(ok)
+            return False
+
+        if callback is None or not HAS_GLIB:
+            ok = connect()
+            finish(ok)
+            return ok
+
+        def worker():
+            ok = connect()
+            GLib.idle_add(finish, ok)
+
+        threading.Thread(target=worker, daemon=True, name="StreamConnect").start()
         return True
-    
+
     def switch_to_reading(self, 
                          xy: Optional[Tuple[float, float]] = None,
                          brightness: Optional[int] = None,
@@ -169,7 +195,7 @@ class ModeManager:
             self.sync_controller.stop()
         
         # Step 2: Stop entertainment streaming (disconnect already deactivates)
-        if self.entertainment_stream and self.entertainment_stream.is_connected():
+        if self.entertainment_stream and self.entertainment_stream.is_active():
             timed_print("ModeManager: Stopping entertainment stream")
             self.entertainment_stream.disconnect(self.bridge)
             # Use non-blocking delay to let bridge process deactivation before REST commands
@@ -253,7 +279,7 @@ class ModeManager:
             return True
         
         # Stop entertainment stream
-        if self.entertainment_stream and self.entertainment_stream.is_connected():
+        if self.entertainment_stream and self.entertainment_stream.is_active():
             self.entertainment_stream.disconnect(self.bridge)
         
         # Stop reading mode

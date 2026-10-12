@@ -77,6 +77,19 @@
   </branding>
 
   <releases>
+    <release version="0.7.0" date="2026-10-13">
+      <description>
+        <p>Reliability and SteamOS fixes:</p>
+        <ul>
+          <li>Keep the entertainment session alive while screen capture starts, and reconnect automatically if the bridge drops it</li>
+          <li>Native DTLS streaming instead of an openssl subprocess, with a real handshake check</li>
+          <li>X11 screen capture, used automatically on X11 sessions such as SteamOS Desktop Mode</li>
+          <li>Streaming works right after pairing without restarting the app</li>
+          <li>Reading mode only controls lights in the selected entertainment area</li>
+          <li>Lower CPU use: unchanged frames are not re-analysed and frames are pulled at the sync rate</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.2" date="2026-07-16">
       <description>
         <p>Bug fixes:</p>
