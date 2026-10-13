@@ -232,3 +232,14 @@ def test_taken_over_area_is_left_alone_on_stop(bridge_srv, hue):
     bridge_srv.puts.clear()
     stream.disconnect(hue, keep_colors=True, wait=True)
     assert bridge_srv.puts == []  # no "stop", no repainting their lights
+
+
+def test_output_brightness_reports_what_is_streamed(bridge_srv, hue):
+    stream = _stream()
+    assert stream.connect(hue), stream.last_error
+    try:
+        assert stream.output_brightness() is None
+        stream.send_colors_xy({0: ((0.6, 0.3), 254), 1: ((0.2, 0.1), 127)})
+        assert stream.output_brightness() == 75.0
+    finally:
+        stream.disconnect(hue)

@@ -470,6 +470,13 @@ class EntertainmentStream:
         except Exception as e:
             print(f"Could not keep last colours: {e}")
 
+    def output_brightness(self) -> Optional[float]:
+        """Average brightness currently streamed to the lights, 0-100%."""
+        colors = self._last_channel_colors
+        if not colors:
+            return None
+        return round(sum(bri for _, bri in colors.values()) / len(colors) / 254 * 100, 1)
+
     def is_active(self) -> bool:
         """True between connect() and disconnect(), even while reconnecting."""
         return self._active
