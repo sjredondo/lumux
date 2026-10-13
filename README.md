@@ -1,7 +1,5 @@
 # Lumux — Philips Hue Sync for Wayland
 
-[![Flathub](https://flathub.org/api/badge?locale=en)](https://flathub.org/apps/io.github.enginkirmaci.lumux)
-
 Real-time ambient lighting synchronization for Philips Hue lights on Linux (Wayland) using a GTK4/Adwaita interface.
 
 **Status:** Active
