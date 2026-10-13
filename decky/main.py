@@ -50,6 +50,10 @@ class Plugin:
             try:
                 daemon = await client.request(sup.sock, "status", timeout=3.0)
                 sup.state = "running"
+                rev = daemon.get("settings_revision")
+                if (rev is not None and sup._saved_revision is not None
+                        and rev != sup._saved_revision):
+                    asyncio.ensure_future(sup.persist_settings(rev))
             except Exception:
                 daemon = None
         return {

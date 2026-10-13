@@ -72,12 +72,16 @@ def test_flatpak_command(tmp_path):
     sup = _sup(tmp_path, which=lambda name, path=None: f"/usr/bin/{name}")
     assert sup.build_command("flatpak") == [
         "/usr/bin/flatpak", "run", "--command=lumux-daemon", "io.github.enginkirmaci.lumux",
-        "--socket", sup.sock, "--backend", "gamescope", "--config-dir", sup.config_dir]
+        "--socket", sup.sock, "--backend", "gamescope", "--config-dir", sup.config_dir,
+        "--external-settings"]
     # Decky and the desktop window must share the Flatpak's settings.json
     assert sup.config_dir == os.path.join(
         sup.home, ".var", "app", "io.github.enginkirmaci.lumux", "config", "lumux")
     sup.set_setting("node", "57")
-    assert sup.build_command("host", autostart=True)[-3:] == ["--node", "57", "--autostart"]
+    cmd = sup.build_command("host", autostart=True)
+    assert cmd[-2:] == ["--node", "57"]
+    # autostart is sent by the plugin after pushing settings, not as a flag
+    assert "--autostart" not in cmd
 
 
 def test_settings_validation_and_persistence(tmp_path):
@@ -169,5 +173,71 @@ def test_plugin_drives_daemon(tmp_path, monkeypatch):
         await plugin._unload()
         assert plugin.supervisor.state == "stopped"
         assert not os.path.exists(sock)
+
+    asyncio.run(go())
+
+
+def test_persist_never_overwrites_before_settings_were_pushed(tmp_path):
+    sup = _sup(tmp_path)
+    os.makedirs(sup.config_dir)
+    with open(sup.lumux_settings_file, "w") as f:
+        f.write('{"hue": {"app_key": "keep-me"}}')
+    asyncio.run(sup.persist_settings(5))  # no daemon pushed yet: must be a no-op
+    with open(sup.lumux_settings_file) as f:
+        assert "keep-me" in f.read()
+
+
+def test_plugin_owns_settings_json(tmp_path, monkeypatch):
+    """The daemon (in Decky's Flatpak sandbox) may not see the host's
+    settings.json at all; the plugin pushes it in and writes changes back."""
+    import json
+
+    sock = str(tmp_path / "run" / "daemon.sock")
+    monkeypatch.setattr(client, "socket_path", lambda uid=None: sock)
+    unreachable = tmp_path / "sandbox-view"  # what the daemon would see
+    main = _load_plugin(tmp_path, monkeypatch)
+    plugin = main.Plugin()
+    host_cfg = tmp_path / "home" / ".var" / "app" / "io.github.enginkirmaci.lumux" / "config" / "lumux"
+    host_cfg.mkdir(parents=True)
+    desktop = {
+        "hue": {"bridge_ip": "192.0.2.10", "app_key": "desk-key", "client_key": "00" * 16,
+                "entertainment_config_id": "area-1"},
+        "sync": {"brightness_scale": 1.0, "saturation": 1.0},
+        "ui": {"minimize_at_startup": True},  # desktop-only: must survive
+    }
+    (host_cfg / "settings.json").write_text(json.dumps(desktop))
+
+    async def go():
+        await plugin._main()
+        plugin.supervisor.set_setting(
+            "custom_command",
+            f"env PYTHONPATH={os.pathsep.join(sys.path)} {sys.executable} -m lumux.daemon",
+        )
+        # the daemon gets a config dir it can't use; it must not need it
+        plugin.supervisor.config_dir_for_daemon = str(unreachable)
+        status = await plugin.get_status()
+        deadline = time.monotonic() + 30
+        # the panel may see the daemon a moment before the push completes
+        while (status["daemon"] is None or not status["daemon"]["paired"]) \
+                and time.monotonic() < deadline:
+            await asyncio.sleep(0.3)
+            status = await plugin.get_status()
+        daemon = status["daemon"]
+        assert daemon, plugin.supervisor.log_tail()
+        assert daemon["paired"] and daemon["area_id"] == "area-1"  # read from the host file
+        assert daemon["bridge"]["ip"] == "192.0.2.10"
+
+        res = await plugin.set_brightness(0.7)
+        assert res["ok"], res
+        res = await plugin.set_saturation(1.4)
+        assert res["ok"], res
+        saved = json.loads((host_cfg / "settings.json").read_text())
+        assert saved["sync"]["brightness_scale"] == 0.7
+        assert saved["sync"]["saturation"] == 1.4
+        assert saved["hue"]["app_key"] == "desk-key"
+        assert saved["ui"]["minimize_at_startup"] is True
+        assert not unreachable.exists()  # the daemon never wrote anything itself
+
+        await plugin._unload()
 
     asyncio.run(go())

@@ -81,7 +81,7 @@
       <description>
         <ul>
           <li>More vivid default: 100% saturation now equals the old 200%</li>
-          <li>Decky plugin uses the same settings as the desktop app (no second setup, saving works)</li>
+          <li>Decky plugin uses the desktop app's settings: no second pairing, and pairing/slider changes save correctly (the plugin now reads and writes settings.json itself, since the Flatpak sandbox Decky starts may not see it)</li>
         </ul>
       </description>
     </release>
