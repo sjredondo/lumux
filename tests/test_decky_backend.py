@@ -72,7 +72,10 @@ def test_flatpak_command(tmp_path):
     sup = _sup(tmp_path, which=lambda name, path=None: f"/usr/bin/{name}")
     assert sup.build_command("flatpak") == [
         "/usr/bin/flatpak", "run", "--command=lumux-daemon", "io.github.enginkirmaci.lumux",
-        "--socket", sup.sock, "--backend", "gamescope"]
+        "--socket", sup.sock, "--backend", "gamescope", "--config-dir", sup.config_dir]
+    # Decky and the desktop window must share the Flatpak's settings.json
+    assert sup.config_dir == os.path.join(
+        sup.home, ".var", "app", "io.github.enginkirmaci.lumux", "config", "lumux")
     sup.set_setting("node", "57")
     assert sup.build_command("host", autostart=True)[-3:] == ["--node", "57", "--autostart"]
 

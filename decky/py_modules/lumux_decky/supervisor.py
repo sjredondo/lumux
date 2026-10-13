@@ -86,6 +86,11 @@ class Supervisor:
     ):
         self.uid = os.getuid() if uid is None else uid
         self.home = home
+        # The desktop app's settings (pairing, area, sliders). Passed to the
+        # daemon explicitly so Decky and the desktop window always share one
+        # settings.json, whatever environment Decky starts us with. Flatpak
+        # mounts this directory at the same path inside the sandbox.
+        self.config_dir = os.path.join(home, ".var", "app", FLATPAK_APP_ID, "config", "lumux")
         self.settings_file = os.path.join(settings_dir, "settings.json")
         self.log_file = os.path.join(log_dir, "daemon.log")
         self.sock = sock_path or client.socket_path(self.uid)
@@ -179,7 +184,11 @@ class Supervisor:
         return None
 
     def build_command(self, runner: str, autostart: bool = False) -> List[str]:
-        daemon_args = ["--socket", self.sock, "--backend", "gamescope"]
+        daemon_args = [
+            "--socket", self.sock,
+            "--backend", "gamescope",
+            "--config-dir", self.config_dir,
+        ]
         node = (self.settings.get("node") or "").strip()
         if node:
             daemon_args += ["--node", node]
@@ -244,6 +253,10 @@ class Supervisor:
             return False
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+        except OSError as e:
+            self._log("warning", f"could not create {self.config_dir}: {e}")
         self._rotate_log()
         self.state, self.runner, self.error = "starting", runner, ""
         self._log("info", f"starting lumux-daemon via {runner}: {shlex.join(argv)}")
