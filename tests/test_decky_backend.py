@@ -241,3 +241,59 @@ def test_plugin_owns_settings_json(tmp_path, monkeypatch):
         await plugin._unload()
 
     asyncio.run(go())
+
+
+@pytest.mark.skipif(not __import__("fake_bridge").can_run(), reason="needs root + openssl (container)")
+def test_first_setup_in_game_mode_creates_settings_json(tmp_path, monkeypatch):
+    """No desktop setup yet: pairing from the Decky panel must create the
+    shared settings.json (pairing + auto-selected area) for both apps."""
+    import json
+
+    import fake_bridge as fb
+
+    srv = fb.FakeBridge().start()
+    srv.link_pressed = True
+    sock = str(tmp_path / "run" / "daemon.sock")
+    monkeypatch.setattr(client, "socket_path", lambda uid=None: sock)
+    main = _load_plugin(tmp_path, monkeypatch)
+    plugin = main.Plugin()
+    host_file = (tmp_path / "home" / ".var" / "app" / "io.github.enginkirmaci.lumux"
+                 / "config" / "lumux" / "settings.json")
+
+    async def go():
+        await plugin._main()
+        plugin.supervisor.set_setting(
+            "custom_command",
+            f"env PYTHONPATH={os.pathsep.join(sys.path)} {sys.executable} -m lumux.daemon",
+        )
+        status = await plugin.get_status()
+        deadline = time.monotonic() + 30
+        while status["daemon"] is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.3)
+            status = await plugin.get_status()
+        assert status["daemon"]["state"] == "unpaired"
+        assert not host_file.exists()
+
+        res = await plugin.pair("127.0.0.1")
+        assert res["ok"], res
+        saved = json.loads(host_file.read_text())
+        assert saved["hue"]["app_key"] == fb.APP_KEY
+        assert saved["hue"]["client_key"] == fb.CLIENT_KEY
+        assert saved["hue"]["entertainment_config_id"] == fb.ENT_ID  # single area
+        status = await plugin.get_status()
+        assert status["daemon"]["paired"]
+
+        # a restarted service (e.g. next boot) picks the pairing up again
+        assert (await plugin.restart_service())["ok"]
+        status = await plugin.get_status()
+        deadline = time.monotonic() + 15
+        while not (status["daemon"] and status["daemon"]["paired"]) and time.monotonic() < deadline:
+            await asyncio.sleep(0.3)
+            status = await plugin.get_status()
+        assert status["daemon"]["paired"]
+        await plugin._unload()
+
+    try:
+        asyncio.run(go())
+    finally:
+        srv.stop()

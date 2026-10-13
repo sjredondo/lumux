@@ -83,7 +83,9 @@ class Plugin:
         return await self._call("set_saturation", value=float(value))
 
     async def pair(self, bridge_ip: str = "") -> dict:
-        args = {"timeout": 30}
+        # link_timeout, not timeout: that name is the request timeout below,
+        # and passing both made every pairing attempt raise a TypeError.
+        args = {"link_timeout": 30}
         if bridge_ip:
             args["bridge_ip"] = bridge_ip
         return await self._call("pair", timeout=45.0, **args)

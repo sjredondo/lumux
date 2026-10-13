@@ -11,7 +11,7 @@ socket speaking JSON lines::
 
 Commands: ping, status, start, stop, set_brightness {value},
 set_saturation {value}, get_settings, load_settings {settings}, list_areas,
-select_area {area_id}, discover, pair {bridge_ip?, timeout?}, list_nodes,
+select_area {area_id}, discover, pair {bridge_ip?, link_timeout?}, list_nodes,
 set_node {node}, shutdown.
 
 Only GStreamer/GLib are imported from gi. Run ``lumux-daemon --help``.
@@ -554,7 +554,11 @@ class LumuxDaemon:
         if self._pairing:
             raise CommandError("pairing already in progress")
         bridge_ip = args.get("bridge_ip") or self.settings.hue.bridge_ip
-        timeout = max(1.0, min(60.0, float(args.get("timeout", 30.0))))
+        # "link_timeout": how long to wait for the link button. (Plain
+        # "timeout" still works from the CLI, but clashes with the request
+        # timeout in socket clients such as the Decky plugin.)
+        wait = args.get("link_timeout", args.get("timeout", 30.0))
+        timeout = max(1.0, min(60.0, float(wait)))
         self._pairing = True
         try:
             if not bridge_ip:
