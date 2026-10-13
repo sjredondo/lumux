@@ -828,7 +828,12 @@ class MainWindow(Adw.ApplicationWindow):
             if status_type == "status":
                 if message == "syncing":
                     self.status_label.set_text("Syncing")
-                    self.status_subtitle.set_text("Entertainment streaming active")
+                    stream = self.app_context.entertainment_stream
+                    level = stream.output_brightness() if stream else None
+                    self.status_subtitle.set_text(
+                        "Entertainment streaming active"
+                        + (f" · lights at {round(level)}%" if level is not None else "")
+                    )
                     self._update_status_card("syncing")
                     zone_colors = last_status[2]
                     if zone_colors and getattr(

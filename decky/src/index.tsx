@@ -35,6 +35,7 @@ interface DaemonStatus {
   streaming: boolean;
   brightness: number;
   saturation?: number;
+  output_brightness?: number | null;
   capture: { backend: string; node: string; capturing: boolean; error: string };
   fps: number;
   last_error: string;
@@ -326,7 +327,17 @@ function Content() {
     <>
       <PanelSection title="Screen sync">
         <PanelSectionRow>
-          <Field label="Status" description={daemon?.bridge.ip ? `Bridge ${daemon.bridge.ip}` : undefined}>
+          <Field
+            label="Status"
+            description={
+              [
+                daemon?.bridge.ip ? `Bridge ${daemon.bridge.ip}` : "",
+                daemon?.syncing && daemon.output_brightness != null
+                  ? `Lights at ${Math.round(daemon.output_brightness)}%`
+                  : "",
+              ].filter(Boolean).join(" · ") || undefined
+            }
+          >
             {busy ? <Spinner style={{ width: "20px", height: "20px" }} /> : describe(status)}
           </Field>
         </PanelSectionRow>

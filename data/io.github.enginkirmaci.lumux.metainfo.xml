@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.8.8" date="2026-10-13">
+      <description>
+        <ul>
+          <li>Brightness reaches the slider value: smoothing no longer stalls short of it, and dark-but-coloured scenes no longer dim the lights (only true black fades)</li>
+          <li>Shows the brightness Lumux is sending ("lights at N%") in the Decky panel and the window</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.7" date="2026-10-13">
       <description>
         <ul>

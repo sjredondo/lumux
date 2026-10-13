@@ -65,9 +65,20 @@ def test_brightness_setting_tunes_the_lights_down():
 
 
 def test_black_fades_out_instead_of_turning_white():
-    out = ColorAnalyzer().analyze_zones_batch({"black": (0, 0, 0), "near": (10, 5, 0)})
+    out = ColorAnalyzer().analyze_zones_batch(
+        {"black": (0, 0, 0), "near": (4, 2, 0), "dark_game": (12, 6, 2)})
     assert out["black"][1] == 1
-    assert 100 < out["near"][1] < 140  # ~4% level, half of the black threshold
+    assert 100 < out["near"][1] < 160  # ~1.6% level, half of the black threshold
+    assert out["dark_game"][1] == 254  # dark but coloured (~5%): full brightness
+
+
+def test_smoothing_reaches_the_target_brightness():
+    """int() truncation used to stall a few points below the target."""
+    analyzer = ColorAnalyzer()
+    analyzer.previous_colors = {"z": ((0.3, 0.3), 150)}
+    for _ in range(40):
+        out = analyzer.apply_smoothing({"z": ((0.3, 0.3), 254)}, factor=0.3)
+    assert out["z"][1] == 254
 
 
 def test_old_settings_above_100_percent_are_capped(tmp_path, monkeypatch):

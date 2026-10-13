@@ -36,8 +36,10 @@ class ColorAnalyzer:
     # so near-grey content doesn't make the lights flicker between hues.
     NEUTRAL_CHROMA = 0.15
     # Zones darker than this (black bars, loading screens) fade towards off
-    # instead of turning into full-brightness white.
-    BLACK_LEVEL = 0.08
+    # instead of turning into full-brightness white. Kept low: dark but
+    # coloured game scenes sit around 3-8% and must still drive the lights
+    # at the chosen brightness.
+    BLACK_LEVEL = 0.03
 
     def __init__(
         self, brightness_scale: float = 1.0, gamma: float = 1.0, saturation: float = 1.0
@@ -141,7 +143,11 @@ class ColorAnalyzer:
                     prev_xy[0] + factor * (curr_xy[0] - prev_xy[0]),
                     prev_xy[1] + factor * (curr_xy[1] - prev_xy[1]),
                 )
-                smooth_bri = int(prev_bri + factor * (curr_bri - prev_bri))
+                # round(), not int(): truncating every step made brightness
+                # stall a few points short of the target (never reaching 100%)
+                smooth_bri = int(round(prev_bri + factor * (curr_bri - prev_bri)))
+                if abs(curr_bri - smooth_bri) <= 1:
+                    smooth_bri = curr_bri
 
                 smoothed[zone_id] = (smooth_xy, smooth_bri)
             else:

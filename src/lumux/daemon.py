@@ -402,6 +402,8 @@ class LumuxDaemon:
             },
             "area_id": hue.entertainment_config_id,
             "streaming": bool(stream and stream.is_connected()),
+            # What Lumux is sending right now (compare with the Hue app)
+            "output_brightness": stream.output_brightness() if stream else None,
             "brightness": self.settings.sync.brightness_scale,
             "saturation": self.settings.sync.saturation,
             "capture": {
