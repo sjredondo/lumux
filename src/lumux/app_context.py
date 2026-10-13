@@ -41,7 +41,9 @@ class AppContext:
         self.capture.set_on_restore_token_changed(self._on_restore_token_changed)
         self.zone_processor = ZoneProcessor(settings=settings.zones)
         self.color_analyzer = ColorAnalyzer(
-            brightness_scale=settings.sync.brightness_scale, gamma=settings.sync.gamma
+            brightness_scale=settings.sync.brightness_scale,
+            gamma=settings.sync.gamma,
+            saturation=settings.sync.saturation,
         )
         self.zone_mapping = settings.get_zone_mapping()
 
@@ -102,9 +104,13 @@ class AppContext:
             self.entertainment_stream.disconnect(self.bridge)
 
     def shutdown(self) -> None:
-        """Stop background workers and any running sync, turning off lights."""
+        """Stop background workers and any running sync.
+
+        Lights are left on (in their last synced colours); quitting Lumux or
+        leaving Game Mode must not switch anyone's lights off.
+        """
         if hasattr(self, "mode_manager"):
-            self.mode_manager.turn_off(turn_off_lights=True)
+            self.mode_manager.turn_off(turn_off_lights=False, wait=True)
         else:
             try:
                 if self.sync_controller.is_running():
@@ -130,6 +136,7 @@ class AppContext:
 
             self.color_analyzer.brightness_scale = self.settings.sync.brightness_scale
             self.color_analyzer.gamma = self.settings.sync.gamma
+            self.color_analyzer.saturation = self.settings.sync.saturation
 
             self.zone_processor.rows = int(self.settings.zones.rows)
             self.zone_processor.cols = int(self.settings.zones.cols)
