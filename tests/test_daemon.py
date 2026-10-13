@@ -134,15 +134,15 @@ def test_bad_requests_get_errors_not_crashes(daemon):
 def test_set_brightness_is_clamped_and_saved(daemon):
     assert daemon.result("set_brightness", value=0.4)["brightness"] == 0.4
     assert _load(daemon.config)["sync"]["brightness_scale"] == 0.4
-    assert daemon.result("set_brightness", value=9)["brightness"] == 2.0
-    assert daemon.result("status")["brightness"] == 2.0
+    assert daemon.result("set_brightness", value=9)["brightness"] == 1.0  # Hue max
+    assert daemon.result("status")["brightness"] == 1.0
 
 
 def test_set_saturation_is_clamped_and_saved(daemon):
-    assert daemon.result("set_saturation", value=1.8)["saturation"] == 1.8
-    assert _load(daemon.config)["sync"]["saturation"] == 1.8
-    assert daemon.result("set_saturation", value=9)["saturation"] == 3.0
-    assert daemon.result("status")["saturation"] == 3.0
+    assert daemon.result("set_saturation", value=0.6)["saturation"] == 0.6
+    assert _load(daemon.config)["sync"]["saturation"] == 0.6
+    assert daemon.result("set_saturation", value=9)["saturation"] == 1.0  # fully saturated
+    assert daemon.result("status")["saturation"] == 1.0
     assert "numeric" in daemon.call("set_saturation", value="lots")["error"]
 
 

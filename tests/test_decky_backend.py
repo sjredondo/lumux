@@ -157,8 +157,8 @@ def test_plugin_drives_daemon(tmp_path, monkeypatch):
         assert not res["ok"] and "Not paired" in res["error"]
         res = await plugin.set_brightness(0.6)
         assert res["ok"] and res["result"]["brightness"] == 0.6
-        res = await plugin.set_saturation(1.5)
-        assert res["ok"] and res["result"]["saturation"] == 1.5
+        res = await plugin.set_saturation(0.5)
+        assert res["ok"] and res["result"]["saturation"] == 0.5
         res = await plugin.list_areas()
         assert not res["ok"]
         res = await plugin.set_node("gamescope-1")
@@ -229,11 +229,11 @@ def test_plugin_owns_settings_json(tmp_path, monkeypatch):
 
         res = await plugin.set_brightness(0.7)
         assert res["ok"], res
-        res = await plugin.set_saturation(1.4)
+        res = await plugin.set_saturation(0.4)
         assert res["ok"], res
         saved = json.loads((host_cfg / "settings.json").read_text())
         assert saved["sync"]["brightness_scale"] == 0.7
-        assert saved["sync"]["saturation"] == 1.4
+        assert saved["sync"]["saturation"] == 0.4
         assert saved["hue"]["app_key"] == "desk-key"
         assert saved["ui"]["minimize_at_startup"] is True
         assert not unreachable.exists()  # the daemon never wrote anything itself

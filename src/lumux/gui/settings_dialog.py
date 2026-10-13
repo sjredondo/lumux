@@ -305,16 +305,10 @@ class SettingsDialog(Adw.PreferencesDialog):
         # Color group
         color_group = Adw.PreferencesGroup()
         color_group.set_title("Color Adjustments")
-        color_group.set_description("Adjust brightness and color processing")
+        color_group.set_description(
+            "Brightness and saturation are sliders in the main window"
+        )
         sync_page.add(color_group)
-
-        # Brightness scale
-        self.brightness_row = Adw.SpinRow.new_with_range(0.0, 2.0, 0.1)
-        self.brightness_row.set_title("Brightness Scale")
-        self.brightness_row.set_subtitle("Multiply light brightness")
-        self.brightness_row.set_digits(1)
-        self.brightness_row.set_value(self.settings.sync.brightness_scale)
-        color_group.add(self.brightness_row)
 
         # Gamma
         self.gamma_row = Adw.SpinRow.new_with_range(0.1, 3.0, 0.1)
@@ -644,7 +638,6 @@ class SettingsDialog(Adw.PreferencesDialog):
         # Sync settings
         self.settings.sync.fps = int(self.fps_row.get_value())
         self.settings.sync.transition_time_ms = int(self.transition_row.get_value())
-        self.settings.sync.brightness_scale = self.brightness_row.get_value()
         self.settings.sync.gamma = self.gamma_row.get_value()
         self.settings.sync.smoothing_factor = self.smoothing_row.get_value()
         # UI settings - startup is handled immediately in _on_startup_toggled
