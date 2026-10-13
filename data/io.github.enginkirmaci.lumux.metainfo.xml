@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.8.4" date="2026-10-13">
+      <description>
+        <ul>
+          <li>decky-lumux: the "Lumux not installed" state no longer sticks after (re)installing the Flatpak, so the bridge pairing option appears in Game Mode</li>
+          <li>decky-lumux: "Check again" button and the reason the Flatpak wasn't found</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.3" date="2026-10-13">
       <description>
         <ul>

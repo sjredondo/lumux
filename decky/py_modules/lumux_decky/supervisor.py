@@ -62,6 +62,11 @@ def child_env(home: str, uid: int, base: Optional[Dict[str, str]] = None) -> Dic
         env.pop(key, None)
     runtime = f"/run/user/{uid}"
     env["HOME"] = home
+    # Decky's environment may carry another user's XDG dirs (it starts as
+    # root); flatpak uses XDG_DATA_HOME to find the --user installation.
+    for key in ("XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+        if env.get(key) and not env[key].startswith(home + os.sep):
+            env.pop(key)
     env.setdefault("XDG_RUNTIME_DIR", runtime)
     bus = os.path.join(env["XDG_RUNTIME_DIR"], "bus")
     if "DBUS_SESSION_BUS_ADDRESS" not in env and os.path.exists(bus):
@@ -120,6 +125,8 @@ class Supervisor:
         self._start_lock = asyncio.Lock()
         self._watch_task: Optional[asyncio.Task] = None
         self._flatpak_cache: Optional[bool] = None
+        self._flatpak_checked_at = 0.0
+        self._flatpak_last_detail = ""
 
     # -- settings ---------------------------------------------------------
 
@@ -158,22 +165,44 @@ class Supervisor:
     def _env(self) -> Dict[str, str]:
         return child_env(self.home, self.uid)
 
+    # A "not installed" answer is only trusted this long: the user may be
+    # (re)installing the Flatpak right now. A positive answer is kept.
+    FLATPAK_RECHECK_S = 5.0
+
     async def flatpak_installed(self, refresh: bool = False) -> bool:
-        if self._flatpak_cache is not None and not refresh:
-            return self._flatpak_cache
-        flatpak = self._which("flatpak", path=self._env()["PATH"])
+        if not refresh:
+            if self._flatpak_cache:
+                return True
+            if (self._flatpak_cache is False
+                    and time.monotonic() - self._flatpak_checked_at < self.FLATPAK_RECHECK_S):
+                return False
+        env = self._env()
+        flatpak = self._which("flatpak", path=env["PATH"])
         ok = False
+        detail = "flatpak command not found"
         if flatpak:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     flatpak, "info", "--show-ref", FLATPAK_APP_ID,
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                    env=self._env(),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    env=env,
                 )
-                ok = await asyncio.wait_for(proc.wait(), 15) == 0
-            except (OSError, asyncio.TimeoutError):
-                ok = False
+                out, err = await asyncio.wait_for(proc.communicate(), 15)
+                ok = proc.returncode == 0
+                detail = (err or out or b"").decode(errors="replace").strip()
+            except (OSError, asyncio.TimeoutError) as e:
+                detail = f"{type(e).__name__}: {e}"
+        if not ok and detail != self._flatpak_last_detail:
+            # Logged once per distinct reason, with what flatpak looked at
+            self._log(
+                "warning",
+                f"Lumux Flatpak not found ({detail or 'no output'}); "
+                f"uid={os.getuid()} HOME={env.get('HOME')} "
+                f"XDG_DATA_HOME={env.get('XDG_DATA_HOME', '')}",
+            )
+        self._flatpak_last_detail = "" if ok else detail
         self._flatpak_cache = ok
+        self._flatpak_checked_at = time.monotonic()
         return ok
 
     def host_daemon(self) -> Optional[str]:
@@ -254,9 +283,12 @@ class Supervisor:
             self.state = "missing"
             self.runner = ""
             self.error = (
-                "Lumux is not installed. Install the Lumux Flatpak in Desktop Mode "
-                "(see the plugin README), pair your bridge there, then come back."
+                "The Lumux Flatpak (io.github.enginkirmaci.lumux) wasn't found. "
+                "Install lumux.flatpak from the latest release (one time, from "
+                "Desktop Mode or SSH); you can pair the bridge right here after."
             )
+            if self._flatpak_last_detail:
+                self.error += f" [flatpak: {self._flatpak_last_detail[:160]}]"
             return False
         try:
             argv = self.build_command(runner, autostart=autostart)

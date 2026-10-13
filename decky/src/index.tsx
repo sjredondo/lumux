@@ -299,12 +299,23 @@ function Content() {
       {(status?.service === "missing" || (daemon && !paired)) && (
         <PanelSection title="Setup">
           {status?.service === "missing" ? (
-            <PanelSectionRow>
-              <Field
-                label="Install Lumux"
-                description="Install the Lumux Flatpak and pair your bridge in Desktop Mode."
-              />
-            </PanelSectionRow>
+            <>
+              <PanelSectionRow>
+                <Field
+                  label="Lumux Flatpak not found"
+                  description="Install lumux.flatpak from the latest release once (Desktop Mode or SSH). Pairing the bridge happens right here afterwards."
+                />
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ButtonItem
+                  layout="below"
+                  disabled={busy !== ""}
+                  onClick={() => run("restart", () => restartService())}
+                >
+                  {busy === "restart" ? "Checking…" : "Check again"}
+                </ButtonItem>
+              </PanelSectionRow>
+            </>
           ) : (
             <PanelSectionRow>
               <ButtonItem
