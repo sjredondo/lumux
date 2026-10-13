@@ -71,6 +71,15 @@ class EntertainmentStream:
     # covers occasional UDP loss without wasting CPU.
     STREAM_HZ = 30
     RECONNECT_BACKOFF_MAX = 10.0
+    # A session that dies this soon after (re)connecting counts as "taken
+    # over"; after TAKEOVER_LIMIT of those in a row we stop fighting.
+    QUICK_DROP_S = 15.0
+    TAKEOVER_LIMIT = 3
+    TAKEOVER_ERROR = (
+        "Another app keeps taking over this entertainment area (a second "
+        "Lumux, e.g. the Decky plugin or the desktop window, the Hue app, or "
+        "a Hue Sync Box). Stop it, then start sync again."
+    )
 
     def __init__(
         self,
@@ -104,6 +113,7 @@ class EntertainmentStream:
         self._stop_event = threading.Event()
         self._sender: Optional[threading.Thread] = None
         self.last_error: str = ""
+        self._session_started_at = 0.0
 
         # Channel mappings
         self._channels: Dict[int, ChannelInfo] = {}
@@ -207,6 +217,7 @@ class EntertainmentStream:
 
         with self._lock:
             self._transport = transport
+        self._session_started_at = time.monotonic()
         timed_print(
             f"DTLS connection established to {self.bridge_ip}:{HueStreamProtocol.PORT}"
         )
@@ -227,11 +238,27 @@ class EntertainmentStream:
         backoff = 1.0
         next_tick = time.monotonic()
         poll_counter = 0
+        quick_drops = 0
+        lost_handled = False
 
         while not self._stop_event.is_set():
             transport = self._transport
             if transport is None or transport.closed:
                 self._close_transport(notify=False)
+                if not lost_handled:
+                    lost_handled = True
+                    # "Connection refused" right after connecting means the
+                    # bridge handed the area to someone else. Two streamers
+                    # with the same pairing just keep kicking each other off.
+                    if time.monotonic() - self._session_started_at < self.QUICK_DROP_S:
+                        quick_drops += 1
+                    else:
+                        quick_drops = 1
+                    if quick_drops >= self.TAKEOVER_LIMIT:
+                        self.last_error = self.TAKEOVER_ERROR
+                        print(f"Entertainment stream: {self.last_error}")
+                        break
+                self.last_error = "Hue bridge dropped the stream; reconnecting..."
                 timed_print(
                     f"Entertainment stream lost; reconnecting in {backoff:.0f}s..."
                 )
@@ -239,8 +266,11 @@ class EntertainmentStream:
                     break
                 bridge = self._bridge
                 if bridge is not None:
-                    self._deactivate_streaming(bridge)
+                    # No "stop" first: that would kick whoever else is
+                    # streaming to the area and start a tug-of-war.
                     if self._open_session(bridge):
+                        lost_handled = False
+                        self.last_error = ""
                         backoff = 1.0
                         next_tick = time.monotonic()
                         continue

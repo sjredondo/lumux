@@ -146,6 +146,9 @@ class ScreenCapture:
         # through this fd, not through the plain PipeWire socket.
         self._pipewire_fd: Optional[int] = None
         self._pipeline_started_at = 0.0
+        # Until a non-black frame arrives, a freshly started pipeline is
+        # "unproven"; if it only ever yields pure black we try the next one.
+        self._validating_pipeline = False
         self._no_frames_reported = False
         self._portal_cancel = threading.Event()
         self._portal_retry_at = 0.0
@@ -306,6 +309,8 @@ class ScreenCapture:
         """Fetch the newest frame if one arrived. Returns True if new."""
         if not self._pipeline_running:
             return False
+        if self._needs_pipeline_restart:
+            return True  # make the sync loop call capture(), which restarts
         self._drain_bus()
         if not self._pipeline_running:
             return False
@@ -417,7 +422,49 @@ class ScreenCapture:
             return False
         self._latest_frame = frame
         self._frame_seq += 1
+        if self._validating_pipeline:
+            self._validate_frame(frame)
         return True
+
+    BLACK_FRAME_GRACE_S = 3.0
+
+    def _validate_frame(self, frame) -> None:
+        """Detect pipelines that run but deliver only pure-black frames.
+
+        A broken GPU-buffer import doesn't raise an error; every frame is
+        just zeros. A real desktop is practically never *exactly* black
+        everywhere, so if nothing but zeros arrives during the first few
+        seconds, mark this pipeline as failed and fall back to the next one
+        (unless it's the last option left).
+        """
+        if np is None or not isinstance(frame, np.ndarray):
+            self._validating_pipeline = False
+            return
+        if frame.any():
+            self._validating_pipeline = False
+            return
+        if time.monotonic() - self._pipeline_started_at < self.BLACK_FRAME_GRACE_S:
+            return
+        self._validating_pipeline = False
+        key = self._active_config_key
+        src = self._source_element()
+        alternatives = [
+            c for c in (self._get_pipeline_configs(src) if src else [])
+            if self._config_key(c) not in self._runtime_failed_configs
+            and self._config_key(c) != key
+        ]
+        if key and alternatives:
+            print(
+                "[capture] Pipeline only produced black frames "
+                f"({self._describe_key(key)}); trying the next capture method"
+            )
+            self._runtime_failed_configs.add(key)
+            self._needs_pipeline_restart = True
+        else:
+            print("[capture] Captured frames are completely black (no other capture method left)")
+
+    def _describe_key(self, key: str) -> str:
+        return self._describe(key)
 
     def _process_image(self, screen):
         if screen is None or screen.size == 0:
@@ -747,6 +794,24 @@ class ScreenCapture:
                 )
             return configs
 
+        if self._active_backend == "portal" and has_videoconvert:
+            # Ask PipeWire for plain shared-memory frames first. Plain
+            # "video/x-raw" caps (no memory:DMABuf feature) make the
+            # compositor send MemFd/SHM buffers instead of GPU buffers. The
+            # GL/DMA-BUF import path can silently yield all-black frames
+            # (e.g. KDE on the Steam Deck: lights stuck at 1%, empty
+            # preview); it stays below as a fallback.
+            sysmem = f"{src} ! video/x-raw"
+            if target_w and target_h and has_videoscale:
+                configs.append(
+                    f"{sysmem} ! videoscale ! "
+                    f"video/x-raw,width={target_w},height={target_h} ! videoconvert ! "
+                    f"video/x-raw,format=RGB ! appsink {sink_props}"
+                )
+            configs.append(
+                f"{sysmem} ! videoconvert ! video/x-raw,format=RGB ! appsink {sink_props}"
+            )
+
         if target_w and target_h:
             scaled_caps = f"video/x-raw,format=RGB,width={target_w},height={target_h}"
 
@@ -870,6 +935,7 @@ class ScreenCapture:
 
                 self._pipeline_running = True
                 self._pipeline_started_at = time.monotonic()
+                self._validating_pipeline = True
                 self._pipeline_error_logged = False
                 self._active_config_key = config_key
                 scale_info = (

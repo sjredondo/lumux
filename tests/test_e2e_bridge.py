@@ -151,3 +151,35 @@ def test_sync_controller_streams_zone_colours(bridge_srv, hue):
     finally:
         sync.stop()
         stream.disconnect(hue)
+
+
+def test_gives_up_when_area_keeps_being_taken_over(bridge_srv, hue):
+    """Two streamers with the same pairing kick each other off forever
+    ("DTLS send failed: Connection refused"); stop after a few quick drops
+    and say why, instead of fighting."""
+    stream = _stream()
+    assert stream.connect(hue), stream.last_error
+    try:
+        for _ in range(stream.TAKEOVER_LIMIT):
+            assert stream.is_connected() or _wait(stream.is_connected, 6)
+            starts = bridge_srv.stream_actions().count("start")
+            bridge_srv.stop_dtls()  # someone else took the area
+            time.sleep(0.3)
+            bridge_srv.start_dtls()
+            _wait(lambda: bridge_srv.stream_actions().count("start") > starts
+                  or stream.last_error == stream.TAKEOVER_ERROR, 8)
+        assert _wait(lambda: stream.last_error == stream.TAKEOVER_ERROR, 8), stream.last_error
+        assert not stream.is_connected()
+        # it never sent "stop" for the area while reconnecting
+        assert "stop" not in bridge_srv.stream_actions()
+    finally:
+        stream.disconnect(hue)
+
+
+def _wait(cond, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(0.1)
+    return cond()
