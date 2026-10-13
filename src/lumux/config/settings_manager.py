@@ -107,6 +107,10 @@ class SettingsManager:
         self._settings = Settings()
         self._config_dir = self._get_config_dir()
         self._settings_file = self._config_dir / "settings.json"
+        timed_print(
+            f"Settings file: {self._settings_file} "
+            f"({'exists' if self._settings_file.exists() else 'not created yet'})"
+        )
         self._load_settings()
 
     def _get_config_dir(self) -> Path:
@@ -230,8 +234,14 @@ class SettingsManager:
             "reading_mode": asdict(self._settings.reading_mode),
         }
 
-        with open(self._settings_file, "w") as f:
-            json.dump(data, f, indent=2)
+        try:
+            tmp = self._settings_file.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            tmp.replace(self._settings_file)  # never leave a half-written file
+        except (OSError, TypeError, ValueError) as e:
+            timed_print(f"Error saving settings to {self._settings_file}: {e}")
+            raise
 
     def _validate_settings(self):
         """Validate and clamp settings to valid ranges."""

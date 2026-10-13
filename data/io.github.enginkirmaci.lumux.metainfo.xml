@@ -77,6 +77,18 @@
   </branding>
 
   <releases>
+    <release version="0.8.1" date="2026-10-13">
+      <description>
+        <p>Screen capture fixes:</p>
+        <ul>
+          <li>Ask the screen-cast portal for shared-memory frames first; GPU buffer import could silently produce black frames (lights stuck at 1%)</li>
+          <li>Fall back to the next capture method automatically if a pipeline only produces black frames</li>
+          <li>Starting sync in the window stops the Decky background service if it is streaming, instead of fighting over the entertainment area</li>
+          <li>Start can no longer get stuck after a failed connection attempt</li>
+          <li>Lumux now writes a log file (~/.var/app/io.github.enginkirmaci.lumux/cache/lumux/lumux.log) and says where its settings file is</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-10-13">
       <description>
         <p>SteamOS Game Mode support:</p>

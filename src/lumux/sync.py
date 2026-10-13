@@ -359,6 +359,13 @@ class SyncController:
             stream.send_colors_xy(channel_colors)
             self._last_sent = channel_colors
 
+    def get_warning(self) -> str:
+        """Current problem to show while syncing ("" if none)."""
+        stream = self.entertainment_stream
+        if self.running and stream is not None and stream.is_active() and not stream.is_connected():
+            return stream.last_error or "Reconnecting to the Hue bridge..."
+        return ""
+
     def _queue_status(self, status_type: str, message, data=None):
         """Queue status update for GUI thread."""
         try:

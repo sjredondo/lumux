@@ -787,6 +787,10 @@ class MainWindow(Adw.ApplicationWindow):
                 self._update_sync_button_state(False)
                 self.sync_button.set_sensitive(True)
 
+        warning = self.sync_controller.get_warning()
+        if warning:
+            self.status_subtitle.set_text(warning)
+
         stats = self.sync_controller.get_stats()
         if stats:
             self.fps_value.set_text(f"{stats['fps']:.1f}")

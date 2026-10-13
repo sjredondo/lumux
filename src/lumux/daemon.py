@@ -405,7 +405,9 @@ class LumuxDaemon:
             "fps": round(float(stats.get("fps", 0) or 0), 1) if syncing else 0.0,
             "frames": stats.get("frame_count", 0),
             "last_error": self._last_error,
-            "last_warning": self._last_warning,
+            # Stream problems (e.g. another app taking over the area) first,
+            # so the Decky panel shows why the lights aren't following.
+            "last_warning": self.ctx.sync_controller.get_warning() or self._last_warning,
             "settings_file": str(self.settings._settings_file),
         }
 

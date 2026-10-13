@@ -2,6 +2,14 @@
 
 import os
 import signal
+
+# Log to a file (and GStreamer warnings) before GStreamer gets initialised by
+# the imports below, so users can just send the file when something breaks.
+from lumux.utils.logging import setup_log_file
+
+if os.environ.get("LUMUX_LOG_FILE", "1") != "0":
+    setup_log_file("lumux")
+
 import gi
 
 gi.require_version("Gtk", "4.0")

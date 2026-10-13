@@ -8,6 +8,7 @@ These modes are mutually exclusive - entertainment streaming
 must be stopped before using REST API control.
 """
 
+import os
 import threading
 import time
 from enum import Enum, auto
@@ -25,6 +26,33 @@ from lumux.sync import SyncController
 from lumux.entertainment import EntertainmentStream
 from lumux.reading_mode import ReadingModeController
 from lumux.utils.logging import timed_print
+
+
+def _stop_background_daemon() -> None:
+    """Stop the Decky plugin's lumux-daemon if it is streaming.
+
+    The daemon and this window share the bridge pairing and entertainment
+    area; only one of them can stream at a time, and the other one would
+    keep fighting for the area. Pressing Start here means the user wants
+    this one.
+    """
+    try:
+        from lumux.daemon import default_socket_path, request
+
+        sock = default_socket_path()
+        if not os.path.exists(sock):
+            return
+        status = request(sock, "status", timeout=1.0)
+        if status.get("pid") == os.getpid():
+            return  # we *are* the daemon
+        if status.get("syncing"):
+            timed_print(
+                "ModeManager: Lumux background service (Decky) is syncing; "
+                "stopping it so this window can stream"
+            )
+            request(sock, "stop", timeout=15.0)
+    except Exception as e:
+        timed_print(f"ModeManager: Could not check background service: {e}")
 
 
 class Mode(Enum):
@@ -124,6 +152,7 @@ class ModeManager:
             # double the REST round-trips.
             if stream.is_active():
                 return True
+            _stop_background_daemon()
             if not stream.connect(self.bridge):
                 timed_print(f"ModeManager: Failed to connect entertainment stream: {stream.last_error}")
                 return False
@@ -150,8 +179,15 @@ class ModeManager:
             return ok
 
         def worker():
-            ok = connect()
-            GLib.idle_add(finish, ok)
+            ok = False
+            try:
+                ok = connect()
+            except Exception as e:
+                # Previously an exception here left _video_connecting set
+                # forever, so every later Start click silently did nothing.
+                timed_print(f"ModeManager: Error while connecting: {e}")
+            finally:
+                GLib.idle_add(finish, ok)
 
         threading.Thread(target=worker, daemon=True, name="StreamConnect").start()
         return True
