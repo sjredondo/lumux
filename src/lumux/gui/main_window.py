@@ -372,32 +372,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.sync_button.set_size_request(200, 48)
         self.video_controls.append(self.sync_button)
 
-        # Colour saturation (live while syncing)
-        saturation_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        saturation_box.set_halign(Gtk.Align.CENTER)
-        saturation_label = Gtk.Label(label="Saturation")
-        saturation_label.add_css_class("reading-label")
-        saturation_box.append(saturation_label)
-        self.saturation_value_label = Gtk.Label(
-            label=f"{round(self.settings.sync.saturation * 100)}%"
+        # Live sync sliders: applied immediately, saved after a short pause
+        self._settings_save_id = None
+        sync = self.settings.sync
+        self.brightness_slider = self._add_sync_slider(
+            "Brightness", 0, 100, 5, round(sync.brightness_scale * 100), "%",
+            "100% = Hue's maximum brightness", self._on_sync_brightness_changed,
         )
-        self.saturation_value_label.add_css_class("reading-value-label")
-        self.saturation_value_label.set_width_chars(5)
-        saturation_box.append(self.saturation_value_label)
-        self.saturation_scale = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0, 300, 5
+        self.saturation_slider = self._add_sync_slider(
+            "Saturation", 0, 100, 5, round(sync.saturation * 100), "%",
+            "0% = colours as on screen; 100% = the most vivid colours the lights can show",
+            self._on_saturation_changed,
         )
-        self.saturation_scale.set_value(self.settings.sync.saturation * 100)
-        self.saturation_scale.add_mark(100, Gtk.PositionType.BOTTOM, None)
-        self.saturation_scale.set_size_request(220, -1)
-        self.saturation_scale.set_draw_value(False)
-        self.saturation_scale.set_tooltip_text(
-            "100% = colours as on screen; higher = more vivid lights"
-        )
-        self.saturation_scale.connect("value-changed", self._on_saturation_changed)
-        saturation_box.append(self.saturation_scale)
-        self.video_controls.append(saturation_box)
-        self._saturation_save_id = None
 
         control_box.append(self.video_controls)
 
@@ -643,22 +629,59 @@ class MainWindow(Adw.ApplicationWindow):
             150, self._on_brightness_change_done
         )
 
+    def _add_sync_slider(self, title, lo, hi, step, value, unit, tooltip, handler):
+        """A labelled live slider row under Start Sync."""
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_halign(Gtk.Align.CENTER)
+        label = Gtk.Label(label=title)
+        label.add_css_class("reading-label")
+        label.set_width_chars(10)
+        label.set_xalign(0)
+        box.append(label)
+        value_label = Gtk.Label(label=f"{int(value)}{unit}")
+        value_label.add_css_class("reading-value-label")
+        value_label.set_width_chars(6)
+        box.append(value_label)
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+        scale.set_value(value)
+        scale.set_size_request(220, -1)
+        scale.set_draw_value(False)
+        scale.set_tooltip_text(tooltip)
+        scale._value_label = value_label
+        scale._unit = unit
+        scale.connect("value-changed", handler)
+        box.append(scale)
+        self.video_controls.append(box)
+        return scale
+
+    def _slider_value(self, scale) -> int:
+        value = int(round(scale.get_value()))
+        scale._value_label.set_text(f"{value}{scale._unit}")
+        return value
+
+    def _on_sync_brightness_changed(self, scale):
+        value = self._slider_value(scale) / 100.0
+        self.settings.sync.brightness_scale = value
+        self.app_context.color_analyzer.brightness_scale = value
+        self._schedule_settings_save()
+
     def _on_saturation_changed(self, scale):
-        """Apply immediately (visible on the lights), save after a pause."""
-        value = round(scale.get_value()) / 100.0
-        self.saturation_value_label.set_text(f"{round(value * 100)}%")
+        value = self._slider_value(scale) / 100.0
         self.settings.sync.saturation = value
         self.app_context.color_analyzer.saturation = value
-        if self._saturation_save_id:
-            GLib.source_remove(self._saturation_save_id)
-        self._saturation_save_id = GLib.timeout_add(500, self._save_saturation)
+        self._schedule_settings_save()
 
-    def _save_saturation(self):
-        self._saturation_save_id = None
+    def _schedule_settings_save(self):
+        if self._settings_save_id:
+            GLib.source_remove(self._settings_save_id)
+        self._settings_save_id = GLib.timeout_add(500, self._save_slider_settings)
+
+    def _save_slider_settings(self):
+        self._settings_save_id = None
         try:
             self.settings.save()
         except Exception as e:
-            print(f"Error saving saturation: {e}")
+            print(f"Error saving settings: {e}")
         return False
 
     def _on_preset_clicked(self, button, preset_id: str, hex_color: str):

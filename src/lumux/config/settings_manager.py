@@ -53,7 +53,7 @@ class SyncSettings:
     brightness_scale: float = 1.0
     gamma: float = 1.0
     smoothing_factor: float = 0.3
-    # Colour saturation boost: 1.0 = as captured, 2.0 = twice as vivid
+    # 0.0-1.0 vividness: 1.0 = fully saturated (Hue's most vivid colours)
     saturation: float = 1.0
 
 
@@ -275,15 +275,18 @@ class SettingsManager:
             self._settings.capture.pipewire_node = "gamescope"
         self._settings.sync.fps = max(1, min(60, self._settings.sync.fps))
         try:
+            brightness = float(self._settings.sync.brightness_scale)
+        except (TypeError, ValueError):
+            brightness = 1.0
+        # 1.0 (100%) is Hue's maximum; older versions allowed up to 2.0
+        self._settings.sync.brightness_scale = max(0.0, min(1.0, brightness))
+        try:
             saturation = float(self._settings.sync.saturation)
         except (TypeError, ValueError):
             saturation = 1.0
-        self._settings.sync.saturation = max(0.0, min(3.0, saturation))
+        self._settings.sync.saturation = max(0.0, min(1.0, saturation))
         self._settings.sync.transition_time_ms = max(
             0, min(1000, self._settings.sync.transition_time_ms)
-        )
-        self._settings.sync.brightness_scale = max(
-            0.0, min(2.0, self._settings.sync.brightness_scale)
         )
         self._settings.sync.gamma = max(0.1, min(3.0, self._settings.sync.gamma))
         self._settings.sync.smoothing_factor = max(

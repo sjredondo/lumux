@@ -169,6 +169,49 @@ function InstallProgress({ install }: { install: InstallStatus | null }) {
   );
 }
 
+// --- live sliders ----------------------------------------------------------------
+
+/**
+ * A slider bound to a daemon setting. Shows the user's value until the
+ * daemon reports it back: clearing it as soon as the request returned made
+ * the slider jump back to the previous value (from a status poll that was
+ * still in flight), so it seemed "stuck" and took several tries to move.
+ */
+function useLiveSetting(
+  daemonValue: number | undefined,
+  send: (value: number) => Promise<Result<unknown>>,
+  onError: (error: string) => void,
+): [number | undefined, (value: number) => void] {
+  const [local, setLocal] = useState<number | null>(null);
+  const timer = useRef<number | undefined>(undefined);
+  const holdUntil = useRef(0);
+
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  useEffect(() => {
+    if (local === null || daemonValue === undefined) return;
+    // Converged, or the daemon changed it since (e.g. from the desktop app)
+    if (Math.abs(daemonValue - local) < 0.5 || Date.now() > holdUntil.current) {
+      setLocal(null);
+    }
+  }, [daemonValue, local]);
+
+  const onChange = (value: number) => {
+    setLocal(value);
+    holdUntil.current = Date.now() + 5000;
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      send(value).then((res) => {
+        if (!res.ok) onError(res.error);
+        // keep showing it until a poll after this reply confirms it
+        holdUntil.current = Date.now() + POLL_MS * 2;
+      });
+    }, 250);
+  };
+
+  return [local ?? daemonValue, onChange];
+}
+
 // --- panel -----------------------------------------------------------------------
 
 function Content() {
@@ -176,11 +219,7 @@ function Content() {
   const [areas, setAreas] = useState<Area[]>([]);
   const [busy, setBusy] = useState("");
   const [actionError, setActionError] = useState("");
-  const [brightness, setLocalBrightness] = useState<number | null>(null);
-  const [saturation, setLocalSaturation] = useState<number | null>(null);
-  const saturationTimer = useRef<number | undefined>(undefined);
   const [nodes, setNodes] = useState<PwNode[] | null>(null);
-  const brightnessTimer = useRef<number | undefined>(undefined);
   const lastInstallState = useRef<string>("");
 
   const refresh = useCallback(async () => {
@@ -194,15 +233,16 @@ function Content() {
   useEffect(() => {
     refresh();
     const timer = window.setInterval(refresh, POLL_MS);
-    return () => {
-      window.clearInterval(timer);
-      window.clearTimeout(brightnessTimer.current);
-      window.clearTimeout(saturationTimer.current);
-    };
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
   const daemon = status?.daemon ?? null;
   const paired = !!daemon?.paired;
+  const pctOf = (v: number | undefined) => (v === undefined ? undefined : Math.round(v * 100));
+  const [pct, onBrightness] = useLiveSetting(
+    pctOf(daemon?.brightness), (v) => setBrightness(v / 100), setActionError);
+  const [satPct, onSaturation] = useLiveSetting(
+    pctOf(daemon?.saturation), (v) => setSaturation(v / 100), setActionError);
   const install = status?.install ?? null;
   const lumux = status?.lumux ?? null;
   const installing = !!install?.busy;
@@ -248,28 +288,6 @@ function Content() {
 
   const onArea = (areaId: string) => run("area", () => selectArea(areaId));
 
-  const onBrightness = (pct: number) => {
-    setLocalBrightness(pct);
-    window.clearTimeout(brightnessTimer.current);
-    brightnessTimer.current = window.setTimeout(() => {
-      setBrightness(pct / 100).then((res) => {
-        if (!res.ok) setActionError(res.error);
-        setLocalBrightness(null);
-      });
-    }, 300);
-  };
-
-  const onSaturation = (pct: number) => {
-    setLocalSaturation(pct);
-    window.clearTimeout(saturationTimer.current);
-    saturationTimer.current = window.setTimeout(() => {
-      setSaturation(pct / 100).then((res) => {
-        if (!res.ok) setActionError(res.error);
-        setLocalSaturation(null);
-      });
-    }, 300);
-  };
-
   const onPair = async () => {
     toaster.toast({ title: "Lumux", body: "Press the link button on your Hue bridge…" });
     const res = await run("pair", () => pair(""));
@@ -296,8 +314,6 @@ function Content() {
 
   const syncing = !!daemon && (daemon.syncing || daemon.state === "starting");
   const canSync = !!daemon && paired && !!daemon.area_id && busy === "";
-  const pct = brightness ?? Math.round((daemon?.brightness ?? 1) * 100);
-  const satPct = saturation ?? Math.round((daemon?.saturation ?? 1) * 100);
   const installError = install?.state === "error" ? install.error : "";
   const problem =
     actionError ||
@@ -339,9 +355,10 @@ function Content() {
           <PanelSectionRow>
             <SliderField
               label="Brightness"
-              value={pct}
+              description="100% = Hue's maximum"
+              value={pct ?? 100}
               min={0}
-              max={200}
+              max={100}
               step={5}
               showValue
               valueSuffix="%"
@@ -354,10 +371,10 @@ function Content() {
           <PanelSectionRow>
             <SliderField
               label="Saturation"
-              description="Higher = more vivid colours"
-              value={satPct}
+              description="100% = most vivid colours, 0% = as on screen"
+              value={satPct ?? 100}
               min={0}
-              max={300}
+              max={100}
               step={5}
               showValue
               valueSuffix="%"

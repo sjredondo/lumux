@@ -464,8 +464,8 @@ class LumuxDaemon:
         try:
             value = float(args["value"])
         except (KeyError, TypeError, ValueError):
-            raise CommandError("set_brightness needs a numeric 'value' (0.0-2.0)")
-        value = max(0.0, min(2.0, value))
+            raise CommandError("set_brightness needs a numeric 'value' (0.0-1.0)")
+        value = max(0.0, min(1.0, value))  # 1.0 = Hue maximum
         self.settings.sync.brightness_scale = value
         self.ctx.color_analyzer.brightness_scale = value
         if args.get("save", True):
@@ -494,8 +494,8 @@ class LumuxDaemon:
         try:
             value = float(args["value"])
         except (KeyError, TypeError, ValueError):
-            raise CommandError("set_saturation needs a numeric 'value' (0.0-3.0)")
-        value = max(0.0, min(3.0, value))
+            raise CommandError("set_saturation needs a numeric 'value' (0.0-1.0)")
+        value = max(0.0, min(1.0, value))  # 1.0 = fully saturated
         self.settings.sync.saturation = value
         self.ctx.color_analyzer.saturation = value
         if args.get("save", True):

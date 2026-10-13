@@ -77,6 +77,16 @@
   </branding>
 
   <releases>
+    <release version="0.8.6" date="2026-10-13">
+      <description>
+        <ul>
+          <li>Brightness slider goes to 100% = Hue's maximum (was 200%); lower values now dim proportionally</li>
+          <li>Saturation slider goes to 100% = the most vivid colours the lights can show (was 300%); 0% = as on screen; starts at 100%</li>
+          <li>Decky sliders no longer jump back after you move them</li>
+          <li>Desktop: brightness and saturation are live sliders in the main window</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.5" date="2026-10-13">
       <description>
         <ul>

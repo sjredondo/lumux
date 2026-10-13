@@ -1,5 +1,6 @@
 """Color analysis and conversion for Hue sync."""
 
+import colorsys
 from typing import Dict, Tuple, Optional
 
 from lumux.utils.rgb_xy_converter import rgb_to_xy
@@ -7,19 +8,23 @@ from lumux.utils.rgb_xy_converter import rgb_to_xy
 
 class ColorAnalyzer:
     # Averaged screen edges are rarely near full white, so a 1:1 mapping left
-    # the lights dim. 100% on the brightness setting now means what 200% used
-    # to (anything at half intensity or above drives the light fully).
+    # the lights dim. With this gain, brightness 100% (the slider maximum)
+    # drives a light to Hue's maximum (254) for any zone that is at least
+    # half-bright; lower settings scale that down proportionally.
     BASE_BRIGHTNESS_GAIN = 2.0
-    # Same for saturation: averaged edges look washed out, so 100% on the
-    # saturation setting now means what 200% used to.
-    BASE_SATURATION_GAIN = 2.0
+    # Below this HSV saturation a colour counts as neutral (white/grey/black
+    # UI); it is not forced towards a hue, which would make lights flicker
+    # between random colours on near-grey content.
+    NEUTRAL_SATURATION = 0.15
 
     def __init__(
         self, brightness_scale: float = 1.0, gamma: float = 1.0, saturation: float = 1.0
     ):
+        # 0.0-1.0; 1.0 = Hue maximum
         self.brightness_scale = brightness_scale
         self.gamma = gamma
-        # 1.0 = as captured; >1 makes colours more vivid, <1 more pastel
+        # 0.0-1.0 vividness: 0 = colours as on screen, 1 = fully saturated
+        # (the most vivid colour the lights can show)
         self.saturation = saturation
         self.previous_colors: Dict[str, Tuple[Tuple[float, float], int]] = {}
 
@@ -54,25 +59,30 @@ class ColorAnalyzer:
         r, g, b = rgb
         # Use max component for consistent brightness across all hues
         max_component = max(r, g, b)
-        brightness = int(
-            (max_component / 255.0) * 254.0 * self.BASE_BRIGHTNESS_GAIN * self.brightness_scale
-        )
-        return max(1, min(254, brightness))
+        # Content brightness first (capped at Hue's maximum), *then* the
+        # user's setting: scaling before the cap meant 50% still gave full
+        # brightness on bright scenes, so the slider seemed to do nothing.
+        content = min(254.0, (max_component / 255.0) * 254.0 * self.BASE_BRIGHTNESS_GAIN)
+        scale = max(0.0, min(1.0, self.brightness_scale))
+        return max(1, min(254, int(content * scale)))
 
     def _apply_saturation(self, rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
-        """Push each channel away from (or towards) the pixel's grey level.
+        """Make colours more vivid, keeping their hue and brightness.
 
-        Screen edges averaged over many pixels come out washed-out, so the
-        lights look pale; boosting saturation restores vivid colours.
+        Works in HSV: saturation is moved towards 1.0 by ``self.saturation``
+        (0 = unchanged, 1 = fully saturated, i.e. the purest colour the
+        lights can show). Value (brightness) is untouched. Near-neutral
+        colours get proportionally less push so grey/white stays calm.
         """
-        s = self.saturation * self.BASE_SATURATION_GAIN
-        if abs(s - 1.0) < 1e-3:
-            return rgb
+        p = max(0.0, min(1.0, self.saturation))
         r, g, b = rgb
-        grey = 0.299 * r + 0.587 * g + 0.114 * b
-        return tuple(  # type: ignore[return-value]
-            int(round(max(0.0, min(255.0, grey + (c - grey) * s)))) for c in (r, g, b)
-        )
+        if p <= 0.0 or r == g == b:
+            return rgb
+        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        weight = min(1.0, s / self.NEUTRAL_SATURATION)
+        s = s + (1.0 - s) * p * weight
+        r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
+        return (int(round(r2 * 255)), int(round(g2 * 255)), int(round(b2 * 255)))
 
     def _apply_gamma(self, rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Apply gamma correction to RGB values."""
