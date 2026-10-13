@@ -68,15 +68,15 @@ jobs:
         run: |
           sudo /tmp/decky-cli/decky plugin build -b -o out -s plugin-name decky
           sudo chown -R "$(id -u):$(id -g)" decky out
-          mv out/Lumux.zip lumux-decky.zip
+          mv out/*.zip decky-lumux.zip  # named after plugin.json "name"
       - name: Check zip layout
         run: |
-          unzip -l lumux-decky.zip
-          python3 scripts/check-decky-zip.py lumux-decky.zip
+          unzip -l decky-lumux.zip
+          python3 scripts/check-decky-zip.py decky-lumux.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: lumux-decky
-          path: lumux-decky.zip
+          name: decky-lumux
+          path: decky-lumux.zip
 
   version:
     name: Release check
@@ -124,12 +124,12 @@ jobs:
           name: lumux-flatpak
       - uses: actions/download-artifact@v4
         with:
-          name: lumux-decky
+          name: decky-lumux
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: |
             lumux.flatpak
-            lumux-decky.zip
+            decky-lumux.zip
           generate_release_notes: true

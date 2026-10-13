@@ -375,8 +375,8 @@ function Content() {
 }
 
 export default definePlugin(() => ({
-  name: "Lumux",
-  titleView: <div className={staticClasses.Title}>Lumux</div>,
+  name: "decky-lumux",
+  titleView: <div className={staticClasses.Title}>decky-lumux</div>,
   content: <Content />,
   icon: <FaLightbulb />,
   onDismount() {},

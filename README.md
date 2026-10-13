@@ -55,7 +55,7 @@ Flatpak, which reads gamescope's screen straight from PipeWire (no consent dialo
 1. Install [Decky Loader](https://decky.xyz) and the Lumux Flatpak (above, v0.8.0+).
 2. Pair the bridge, either in the Lumux desktop app in Desktop Mode or later from the
    plugin with the bridge's link button.
-3. Download `lumux-decky.zip` from the
+3. Download `decky-lumux.zip` from the
    [latest release](https://github.com/sjredondo/lumux/releases/latest).
 4. In Game Mode: Decky → ⚙ Settings → Developer → enable Developer mode →
    **Install Plugin from ZIP File** (or **from URL** with the asset link).
