@@ -10,8 +10,8 @@ socket speaking JSON lines::
     <- {"id": 2, "ok": false, "error": "..."}
 
 Commands: ping, status, start, stop, set_brightness {value},
-set_saturation {value}, list_areas,
-select_area {area_id}, discover, pair {bridge_ip?, timeout?}, list_nodes,
+set_saturation {value}, get_settings, load_settings {settings}, list_areas,
+select_area {area_id}, discover, pair {bridge_ip?, link_timeout?}, list_nodes,
 set_node {node}, shutdown.
 
 Only GStreamer/GLib are imported from gi. Run ``lumux-daemon --help``.
@@ -170,7 +170,10 @@ class LumuxDaemon:
             target=self._server.serve_forever, daemon=True, name="ControlSocket"
         ).start()
         timed_print(f"[daemon] Lumux {__version__} listening on {self.socket_path}")
-        timed_print(f"[daemon] settings: {self.settings._settings_file}")
+        if self.settings.external:
+            timed_print("[daemon] settings: provided by the client (--external-settings)")
+        else:
+            timed_print(f"[daemon] settings: {self.settings._settings_file}")
         if autostart:
             GLib.idle_add(self._autostart)
         try:
@@ -235,6 +238,8 @@ class LumuxDaemon:
             "stop": (self._cmd_stop, True),
             "set_brightness": (self._cmd_set_brightness, True),
             "set_saturation": (self._cmd_set_saturation, True),
+            "get_settings": (self._cmd_get_settings, False),
+            "load_settings": (self._cmd_load_settings, True),
             "list_areas": (self._cmd_list_areas, False),
             "select_area": (self._cmd_select_area, True),
             "discover": (self._cmd_discover, False),
@@ -412,6 +417,8 @@ class LumuxDaemon:
             # so the Decky panel shows why the lights aren't following.
             "last_warning": self.ctx.sync_controller.get_warning() or self._last_warning,
             "settings_file": str(self.settings._settings_file),
+            "settings_revision": self.settings.revision,
+            "external_settings": self.settings.external,
         }
 
     def _cmd_start(self, args: dict) -> dict:
@@ -464,6 +471,24 @@ class LumuxDaemon:
         if args.get("save", True):
             self.settings.save()
         return {"brightness": value}
+
+    def _cmd_get_settings(self, args: dict) -> dict:
+        return {"settings": self.settings.to_dict(), "revision": self.settings.revision}
+
+    def _cmd_load_settings(self, args: dict) -> dict:
+        """Take settings from the owner of settings.json (the Decky plugin).
+
+        Inside the Flatpak sandbox started by Decky, the host's settings.json
+        may not be reachable at all, so the plugin reads it and pushes it in.
+        """
+        data = args.get("settings")
+        if not isinstance(data, dict):
+            raise CommandError("load_settings needs a 'settings' object")
+        self.settings.apply_dict(data)
+        self._apply_settings()
+        self._bridge_checked_at = 0.0
+        timed_print(f"[daemon] settings loaded from client (paired={self._paired()})")
+        return {"loaded": True, "paired": self._paired(), "revision": self.settings.revision}
 
     def _cmd_set_saturation(self, args: dict) -> dict:
         try:
@@ -529,7 +554,11 @@ class LumuxDaemon:
         if self._pairing:
             raise CommandError("pairing already in progress")
         bridge_ip = args.get("bridge_ip") or self.settings.hue.bridge_ip
-        timeout = max(1.0, min(60.0, float(args.get("timeout", 30.0))))
+        # "link_timeout": how long to wait for the link button. (Plain
+        # "timeout" still works from the CLI, but clashes with the request
+        # timeout in socket clients such as the Decky plugin.)
+        wait = args.get("link_timeout", args.get("timeout", 30.0))
+        timeout = max(1.0, min(60.0, float(wait)))
         self._pairing = True
         try:
             if not bridge_ip:
@@ -613,6 +642,9 @@ def _parse_args(argv):
     parser.add_argument("--config-dir", default=None,
                         help="directory holding settings.json (default: the "
                         "desktop app's)")
+    parser.add_argument("--external-settings", action="store_true",
+                        help="don't read/write settings.json; the client pushes "
+                        "settings (load_settings) and saves them (get_settings)")
     parser.add_argument("--autostart", action="store_true",
                         help="start syncing right away")
     parser.add_argument("--ctl", metavar="CMD", default=None,
@@ -646,6 +678,8 @@ def main(argv=None) -> int:
 
     if args.config_dir:
         os.environ["LUMUX_CONFIG_DIR"] = args.config_dir
+    if args.external_settings:
+        os.environ["LUMUX_EXTERNAL_SETTINGS"] = "1"
     # Unbuffered-ish logs: the Decky plugin tails them from a file
     try:
         sys.stdout.reconfigure(line_buffering=True)

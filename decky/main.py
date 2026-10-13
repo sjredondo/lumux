@@ -50,6 +50,10 @@ class Plugin:
             try:
                 daemon = await client.request(sup.sock, "status", timeout=3.0)
                 sup.state = "running"
+                rev = daemon.get("settings_revision")
+                if (rev is not None and sup._saved_revision is not None
+                        and rev != sup._saved_revision):
+                    asyncio.ensure_future(sup.persist_settings(rev))
             except Exception:
                 daemon = None
         return {
@@ -79,7 +83,9 @@ class Plugin:
         return await self._call("set_saturation", value=float(value))
 
     async def pair(self, bridge_ip: str = "") -> dict:
-        args = {"timeout": 30}
+        # link_timeout, not timeout: that name is the request timeout below,
+        # and passing both made every pairing attempt raise a TypeError.
+        args = {"link_timeout": 30}
         if bridge_ip:
             args["bridge_ip"] = bridge_ip
         return await self._call("pair", timeout=45.0, **args)

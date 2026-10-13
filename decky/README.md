@@ -36,7 +36,7 @@ Quick Access menu. A thin [Decky Loader](https://decky.xyz) front-end for
 
 ## Installing (sideload)
 
-1. Download `lumux-decky.zip` from the
+1. Download `decky-lumux.zip` from the
    [latest release](https://github.com/sjredondo/lumux/releases/latest).
 2. In Game Mode: Decky (plug icon) → ⚙ Settings → **Developer** → enable
    **Developer mode** if needed.
@@ -74,13 +74,13 @@ Advanced options in the panel:
 - **Restart Lumux service** restarts the daemon.
 
 The runner can also be changed in
-`~/homebrew/settings/Lumux/settings.json`: `"runner"` is `auto`, `flatpak`,
+`~/homebrew/settings/decky-lumux/settings.json`: `"runner"` is `auto`, `flatpak`,
 `host` (a `lumux-daemon` on `PATH`) or `custom` (with `"custom_command"`).
 
 ## Troubleshooting
 
-- Daemon log: `~/homebrew/logs/Lumux/daemon.log`; plugin log:
-  `~/homebrew/logs/Lumux/plugin.log`
+- Daemon log: `~/homebrew/logs/decky-lumux/daemon.log`; plugin log:
+  `~/homebrew/logs/decky-lumux/plugin.log`
 - Talk to the running daemon from Desktop Mode or SSH:
 
   ```bash

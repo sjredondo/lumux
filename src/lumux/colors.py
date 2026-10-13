@@ -10,6 +10,9 @@ class ColorAnalyzer:
     # the lights dim. 100% on the brightness setting now means what 200% used
     # to (anything at half intensity or above drives the light fully).
     BASE_BRIGHTNESS_GAIN = 2.0
+    # Same for saturation: averaged edges look washed out, so 100% on the
+    # saturation setting now means what 200% used to.
+    BASE_SATURATION_GAIN = 2.0
 
     def __init__(
         self, brightness_scale: float = 1.0, gamma: float = 1.0, saturation: float = 1.0
@@ -62,7 +65,7 @@ class ColorAnalyzer:
         Screen edges averaged over many pixels come out washed-out, so the
         lights look pale; boosting saturation restores vivid colours.
         """
-        s = self.saturation
+        s = self.saturation * self.BASE_SATURATION_GAIN
         if abs(s - 1.0) < 1e-3:
             return rgb
         r, g, b = rgb

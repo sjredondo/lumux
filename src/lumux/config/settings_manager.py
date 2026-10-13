@@ -107,6 +107,7 @@ class SettingsManager:
 
     def _init(self):
         self._settings = Settings()
+        self.revision = 0  # bumped on every save()
         self._config_dir = self._get_config_dir()
         self._settings_file = self._config_dir / "settings.json"
         timed_print(
@@ -183,37 +184,24 @@ class SettingsManager:
         names = {f.name for f in fields(cls)}
         return {k: v for k, v in (data or {}).items() if k in names}
 
+    @property
+    def external(self) -> bool:
+        """True when another process owns settings.json (the Decky plugin
+        runs lumux-daemon with --external-settings): nothing is read from or
+        written to disk here; the owner pushes settings in with
+        apply_dict() and saves to_dict() whenever ``revision`` changes."""
+        return os.environ.get("LUMUX_EXTERNAL_SETTINGS") == "1"
+
     def _load_settings(self):
         """Load settings from config file."""
+        if self.external:
+            self._validate_settings()
+            return
         if self._settings_file.exists():
             try:
                 with open(self._settings_file, "r") as f:
                     data = json.load(f)
-
-                self._settings.hue = HueSettings(**self._known(HueSettings, data.get("hue", {})))
-                self._settings.capture = CaptureSettings(**self._known(CaptureSettings, data.get("capture", {})))
-                # Ensure we pass show_preview through when present
-                self._settings.zones = ZoneSettings(**self._known(ZoneSettings, data.get("zones", {})))
-                self._settings.sync = SyncSettings(**self._known(SyncSettings, data.get("sync", {})))
-                # UI settings (optional)
-                self._settings.ui = UISettings(**self._known(UISettings, data.get("ui", {})))
-                # Black bar settings (optional)
-                self._settings.black_bar = BlackBarSettings(**self._known(BlackBarSettings, data.get("black_bar", {})))
-                # Reading mode settings (optional)
-                reading_data = data.get("reading_mode", {})
-                # Handle tuple serialization for color_xy
-                if "color_xy" in reading_data and isinstance(
-                    reading_data["color_xy"], list
-                ):
-                    reading_data["color_xy"] = tuple(reading_data["color_xy"])
-                # Handle light_ids serialization (ensure it's a list)
-                if "light_ids" in reading_data and not isinstance(
-                    reading_data["light_ids"], list
-                ):
-                    reading_data["light_ids"] = []
-                self._settings.reading_mode = ReadingModeSettings(
-                    **self._known(ReadingModeSettings, reading_data)
-                )
+                self.apply_dict(data)
             except (json.JSONDecodeError, TypeError) as e:
                 timed_print(f"Error loading settings: {e}")
                 self._validate_settings()
@@ -221,12 +209,31 @@ class SettingsManager:
         self._ensure_config_dir()
         self._validate_settings()
 
-    def save(self):
-        """Save settings to config file."""
-        self._ensure_config_dir()
+    def apply_dict(self, data: dict) -> None:
+        """Replace all settings with the contents of a settings.json dict."""
+        data = data or {}
+        self._settings.hue = HueSettings(**self._known(HueSettings, data.get("hue", {})))
+        self._settings.capture = CaptureSettings(**self._known(CaptureSettings, data.get("capture", {})))
+        self._settings.zones = ZoneSettings(**self._known(ZoneSettings, data.get("zones", {})))
+        self._settings.sync = SyncSettings(**self._known(SyncSettings, data.get("sync", {})))
+        self._settings.ui = UISettings(**self._known(UISettings, data.get("ui", {})))
+        self._settings.black_bar = BlackBarSettings(**self._known(BlackBarSettings, data.get("black_bar", {})))
+        reading_data = dict(data.get("reading_mode", {}) or {})
+        # Handle tuple serialization for color_xy
+        if "color_xy" in reading_data and isinstance(reading_data["color_xy"], list):
+            reading_data["color_xy"] = tuple(reading_data["color_xy"])
+        # Handle light_ids serialization (ensure it's a list)
+        if "light_ids" in reading_data and not isinstance(reading_data["light_ids"], list):
+            reading_data["light_ids"] = []
+        self._settings.reading_mode = ReadingModeSettings(
+            **self._known(ReadingModeSettings, reading_data)
+        )
         self._validate_settings()
 
-        data = {
+    def to_dict(self) -> dict:
+        """Settings in settings.json form."""
+        self._validate_settings()
+        return {
             "hue": asdict(self._settings.hue),
             "capture": asdict(self._settings.capture),
             "zones": asdict(self._settings.zones),
@@ -235,6 +242,14 @@ class SettingsManager:
             "black_bar": asdict(self._settings.black_bar),
             "reading_mode": asdict(self._settings.reading_mode),
         }
+
+    def save(self):
+        """Save settings to config file."""
+        self.revision = getattr(self, "revision", 0) + 1
+        if self.external:
+            return  # the owner (Decky plugin) picks it up via `revision`
+        self._ensure_config_dir()
+        data = self.to_dict()
 
         try:
             tmp = self._settings_file.with_suffix(".json.tmp")

@@ -27,6 +27,9 @@ from . import client
 
 FLATPAK_APP_ID = client.APP_ID
 RUNNERS = ("auto", "flatpak", "host", "custom")
+# Daemon commands that may change settings.json contents
+SETTINGS_COMMANDS = {"pair", "set_brightness", "set_saturation", "select_area", "set_node"}
+
 DEFAULT_SETTINGS = {
     "runner": "auto",
     "custom_command": "",
@@ -86,6 +89,21 @@ class Supervisor:
     ):
         self.uid = os.getuid() if uid is None else uid
         self.home = home
+        # The desktop app's settings (pairing, area, sliders). Passed to the
+        # daemon explicitly so Decky and the desktop window always share one
+        # settings.json, whatever environment Decky starts us with. Flatpak
+        # mounts this directory at the same path inside the sandbox.
+        self.config_dir = os.path.join(home, ".var", "app", FLATPAK_APP_ID, "config", "lumux")
+        self.lumux_settings_file = os.path.join(self.config_dir, "settings.json")
+        # Path handed to the daemon (only used if it can reach it; tests
+        # point it somewhere unreachable to mimic Decky's sandbox)
+        self.config_dir_for_daemon = self.config_dir
+        # The plugin owns settings.json: the daemon may run in a Flatpak
+        # sandbox that can't see (or write) the host's copy, so we push the
+        # file in at start and write it back whenever the daemon's settings
+        # revision changes.
+        self._saved_revision: Optional[int] = None
+        self._persist_lock = asyncio.Lock()
         self.settings_file = os.path.join(settings_dir, "settings.json")
         self.log_file = os.path.join(log_dir, "daemon.log")
         self.sock = sock_path or client.socket_path(self.uid)
@@ -179,12 +197,15 @@ class Supervisor:
         return None
 
     def build_command(self, runner: str, autostart: bool = False) -> List[str]:
-        daemon_args = ["--socket", self.sock, "--backend", "gamescope"]
+        daemon_args = [
+            "--socket", self.sock,
+            "--backend", "gamescope",
+            "--config-dir", self.config_dir_for_daemon,
+            "--external-settings",
+        ]
         node = (self.settings.get("node") or "").strip()
         if node:
             daemon_args += ["--node", node]
-        if autostart:
-            daemon_args.append("--autostart")
         if runner == "flatpak":
             flatpak = self._which("flatpak", path=self._env()["PATH"]) or "flatpak"
             return [flatpak, "run", "--command=lumux-daemon", FLATPAK_APP_ID, *daemon_args]
@@ -244,6 +265,11 @@ class Supervisor:
             return False
 
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        self._saved_revision = None  # new daemon: nothing pushed yet
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+        except OSError as e:
+            self._log("warning", f"could not create {self.config_dir}: {e}")
         self._rotate_log()
         self.state, self.runner, self.error = "starting", runner, ""
         self._log("info", f"starting lumux-daemon via {runner}: {shlex.join(argv)}")
@@ -271,6 +297,14 @@ class Supervisor:
                 return False  # _watch decides whether to retry
             if await self.alive():
                 self.state = "running"
+                await self.push_settings()
+                if autostart:
+                    # After the push: autostarting before it would find the
+                    # daemon unpaired.
+                    try:
+                        await client.request(self.sock, "start", timeout=20.0)
+                    except Exception as e:
+                        self._log("warning", f"autostart failed: {e}")
                 return True
             await asyncio.sleep(0.3)
         self.state = "crashed"
@@ -372,4 +406,61 @@ class Supervisor:
     async def call(self, cmd: str, timeout: float = 10.0, **args):
         if not await self.ensure_running():
             raise client.DaemonError(self.error or "lumux-daemon is not running")
-        return await client.request(self.sock, cmd, timeout=timeout, **args)
+        result = await client.request(self.sock, cmd, timeout=timeout, **args)
+        if cmd in SETTINGS_COMMANDS:
+            await self.persist_settings()
+        return result
+
+    # -- settings.json ownership ---------------------------------------------
+
+    def read_settings_file(self) -> Optional[dict]:
+        try:
+            with open(self.lumux_settings_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            self._log("warning", f"could not read {self.lumux_settings_file}: {e}")
+            return None
+
+    async def push_settings(self) -> None:
+        """Hand the desktop app's settings.json to the daemon."""
+        data = self.read_settings_file()
+        if data is None:
+            self._log("info", f"no {self.lumux_settings_file} yet; daemon starts unpaired")
+            self._saved_revision = 0
+            return
+        try:
+            res = await client.request(self.sock, "load_settings", timeout=10.0, settings=data)
+            self._saved_revision = res.get("revision", 0)
+            self._log("info", f"loaded {self.lumux_settings_file} (paired={res.get('paired')})")
+        except Exception as e:
+            self._log("error", f"could not load settings into lumux-daemon: {e}")
+
+    async def persist_settings(self, revision: Optional[int] = None) -> None:
+        """Write the daemon's settings to settings.json if they changed."""
+        if self._saved_revision is None:
+            # Settings haven't been pushed into this daemon yet; its values
+            # are defaults and must never overwrite the user's file.
+            return
+        if revision is not None and revision == self._saved_revision:
+            return
+        async with self._persist_lock:
+            try:
+                res = await client.request(self.sock, "get_settings", timeout=5.0)
+            except Exception as e:
+                self._log("warning", f"could not fetch settings from lumux-daemon: {e}")
+                return
+            rev = res.get("revision")
+            if self._saved_revision is None or rev == self._saved_revision:
+                return
+            try:
+                os.makedirs(self.config_dir, exist_ok=True)
+                tmp = self.lumux_settings_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(res["settings"], f, indent=2)
+                os.replace(tmp, self.lumux_settings_file)
+                self._saved_revision = rev
+            except (OSError, KeyError, TypeError) as e:
+                self._log("error", f"could not save {self.lumux_settings_file}: {e}")

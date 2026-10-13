@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.8.3" date="2026-10-13">
+      <description>
+        <ul>
+          <li>More vivid default: 100% saturation now equals the old 200%</li>
+          <li>Decky plugin uses the desktop app's settings: no second pairing, and pairing/slider changes save correctly (the plugin now reads and writes settings.json itself, since the Flatpak sandbox Decky starts may not see it)</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.2" date="2026-10-13">
       <description>
         <ul>

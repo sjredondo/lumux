@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sanity-check a Decky plugin zip: store layout, metadata, no junk.
 
-usage: check-decky-zip.py lumux-decky.zip
+usage: check-decky-zip.py decky-lumux.zip
 """
 
 import json
