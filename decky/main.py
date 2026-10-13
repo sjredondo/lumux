@@ -43,7 +43,8 @@ class Plugin:
         """Service state plus the daemon's own status. Starts the daemon in
         the background the first time the panel asks."""
         sup = self.supervisor
-        if sup.state == "stopped" and not sup._start_lock.locked():
+        # Also retry while "missing": the Flatpak may have just been installed
+        if sup.state in ("stopped", "missing") and not sup._start_lock.locked():
             asyncio.ensure_future(sup.ensure_running())
         daemon = None
         if sup.state in ("running", "starting"):

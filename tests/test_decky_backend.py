@@ -297,3 +297,43 @@ def test_first_setup_in_game_mode_creates_settings_json(tmp_path, monkeypatch):
         asyncio.run(go())
     finally:
         srv.stop()
+
+
+def test_flatpak_not_found_is_not_cached_forever(tmp_path, monkeypatch):
+    """A failed check (e.g. while the Flatpak was being reinstalled) used to
+    stick until Decky restarted, hiding the pairing UI behind "install Lumux"."""
+    import lumux_decky.supervisor as supmod
+
+    installed = {"yes": False}
+
+    class _Proc:
+        def __init__(self):
+            self.returncode = 0 if installed["yes"] else 1
+
+        async def communicate(self):
+            return (b"", b"" if installed["yes"] else b"error: io.github.enginkirmaci.lumux not installed")
+
+    async def fake_exec(*argv, **kw):
+        return _Proc()
+
+    monkeypatch.setattr(supmod.asyncio, "create_subprocess_exec", fake_exec)
+    sup = _sup(tmp_path, which=lambda name, path=None: "/usr/bin/flatpak")
+
+    async def go():
+        assert await sup.flatpak_installed() is False
+        installed["yes"] = True
+        assert await sup.flatpak_installed() is False  # within the recheck window
+        sup._flatpak_checked_at -= sup.FLATPAK_RECHECK_S + 1
+        assert await sup.flatpak_installed() is True
+        installed["yes"] = False
+        assert await sup.flatpak_installed() is True  # positive answers are kept
+
+    asyncio.run(go())
+
+
+def test_child_env_drops_foreign_xdg_dirs(tmp_path):
+    env = child_env("/home/deck", 1000, base={
+        "XDG_DATA_HOME": "/root/.local/share", "XDG_CONFIG_HOME": "/home/deck/.config",
+        "PATH": "/usr/bin"})
+    assert "XDG_DATA_HOME" not in env  # would hide the --user Flatpak install
+    assert env["XDG_CONFIG_HOME"] == "/home/deck/.config"
