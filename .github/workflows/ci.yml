@@ -72,7 +72,9 @@ jobs:
       - name: Check zip layout
         run: |
           unzip -l decky-lumux.zip
-          python3 scripts/check-decky-zip.py decky-lumux.zip
+          # The plugin downloads this release's lumux.flatpak: the pin must match
+          python3 scripts/check-decky-zip.py decky-lumux.zip \
+            --lumux-version "$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"
       - uses: actions/upload-artifact@v4
         with:
           name: decky-lumux

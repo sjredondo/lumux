@@ -5,6 +5,7 @@ import {
   Navigation,
   PanelSection,
   PanelSectionRow,
+  ProgressBarWithInfo,
   SliderField,
   Spinner,
   ToggleField,
@@ -40,6 +41,27 @@ interface DaemonStatus {
   last_warning: string;
 }
 
+interface LumuxInfo {
+  pinned: string; // the Lumux release this plugin installs
+  user: string | null; // null = not installed, "" = version unknown
+  system: string | null;
+  action: "install" | "update" | "";
+}
+
+interface InstallStatus {
+  state: "idle" | "checking" | "downloading" | "installing" | "finishing" | "done" | "error";
+  busy: boolean;
+  mode: "install" | "update" | "";
+  progress: number | null; // 0..1, null = indeterminate
+  message: string;
+  detail: string;
+  error: string;
+  elapsed: number;
+  tag: string;
+  pinned: boolean;
+  version: string;
+}
+
 interface PanelStatus {
   service: "stopped" | "starting" | "running" | "crashed" | "missing";
   service_error: string;
@@ -49,6 +71,8 @@ interface PanelStatus {
   daemon: DaemonStatus | null;
   help_url: string;
   version: string;
+  lumux: LumuxInfo;
+  install: InstallStatus;
 }
 
 interface Area {
@@ -77,6 +101,7 @@ const listNodes = callable<[], Result<{ nodes: PwNode[]; gamescope: PwNode | nul
 const setNode = callable<[node: string], Result<unknown>>("set_node");
 const setSetting = callable<[key: string, value: unknown], Result<unknown>>("set_setting");
 const restartService = callable<[], Result<boolean>>("restart_service");
+const installLumux = callable<[update: boolean], Result<InstallStatus & { started: boolean }>>("install_lumux");
 
 // --- helpers -------------------------------------------------------------------
 
@@ -89,6 +114,7 @@ function openUrl(url: string) {
 
 function describe(s: PanelStatus | null): string {
   if (!s) return "Loading…";
+  if (s.install.busy) return s.install.mode === "update" ? "Updating Lumux…" : "Installing Lumux…";
   if (s.service === "missing") return "Lumux not installed";
   if (s.service === "crashed") return "Service stopped";
   const d = s.daemon;
@@ -118,6 +144,31 @@ function ErrorText({ text }: { text: string }) {
   );
 }
 
+function elapsed(sec: number): string {
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+}
+
+function InstallProgress({ install }: { install: InstallStatus | null }) {
+  if (!install?.busy) return null;
+  return (
+    <>
+      <PanelSectionRow>
+        <ProgressBarWithInfo
+          indeterminate={install.progress === null}
+          nProgress={install.progress === null ? undefined : Math.round(install.progress * 100)}
+          sOperationText={install.message}
+          sTimeRemaining={elapsed(install.elapsed)}
+        />
+      </PanelSectionRow>
+      {install.detail && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.7, wordBreak: "break-word" }}>{install.detail}</div>
+        </PanelSectionRow>
+      )}
+    </>
+  );
+}
+
 // --- panel -----------------------------------------------------------------------
 
 function Content() {
@@ -130,6 +181,7 @@ function Content() {
   const saturationTimer = useRef<number | undefined>(undefined);
   const [nodes, setNodes] = useState<PwNode[] | null>(null);
   const brightnessTimer = useRef<number | undefined>(undefined);
+  const lastInstallState = useRef<string>("");
 
   const refresh = useCallback(async () => {
     try {
@@ -151,6 +203,20 @@ function Content() {
 
   const daemon = status?.daemon ?? null;
   const paired = !!daemon?.paired;
+  const install = status?.install ?? null;
+  const lumux = status?.lumux ?? null;
+  const installing = !!install?.busy;
+
+  useEffect(() => {
+    if (!install) return;
+    const prev = lastInstallState.current;
+    lastInstallState.current = install.state;
+    if (prev && prev !== "done" && install.state === "done") {
+      toaster.toast({ title: "Lumux", body: `${install.message}. Next: pair your Hue bridge.` });
+    } else if (prev && prev !== "error" && install.state === "error") {
+      toaster.toast({ title: "Lumux", body: install.mode === "update" ? "Update failed" : "Install failed" });
+    }
+  }, [install?.state]);
 
   const loadAreas = useCallback(async () => {
     const res = await listAreas();
@@ -213,6 +279,11 @@ function Content() {
     }
   };
 
+  const onInstall = (update: boolean) => run("install", () => installLumux(update));
+  const showUpdate = lumux?.action === "update" || (installing && install?.mode === "update");
+  const showInstall =
+    status?.service === "missing" || lumux?.action === "install" || (installing && install?.mode === "install");
+
   const onDetect = async () => {
     const res = await run("nodes", () => listNodes());
     if (res?.ok && res.result) {
@@ -227,9 +298,11 @@ function Content() {
   const canSync = !!daemon && paired && !!daemon.area_id && busy === "";
   const pct = brightness ?? Math.round((daemon?.brightness ?? 1) * 100);
   const satPct = saturation ?? Math.round((daemon?.saturation ?? 1) * 100);
+  const installError = install?.state === "error" ? install.error : "";
   const problem =
     actionError ||
-    (status?.service === "missing" || status?.service === "crashed" ? status.service_error : "") ||
+    installError ||
+    (!installing && (status?.service === "missing" || status?.service === "crashed") ? status.service_error : "") ||
     daemon?.last_error ||
     (daemon?.syncing ? daemon.capture.error || daemon.last_warning : "");
 
@@ -296,25 +369,69 @@ function Content() {
         <ErrorText text={problem} />
       </PanelSection>
 
-      {(status?.service === "missing" || (daemon && !paired)) && (
+      {showUpdate && (
+        <PanelSection title="Update">
+          <PanelSectionRow>
+            <Field
+              label={`Lumux ${lumux?.pinned ?? ""} is available`}
+              description={
+                `Installed: ${lumux?.user || "unknown version"}. This plugin is made for Lumux ` +
+                `${lumux?.pinned ?? ""}. Syncing pauses for a moment while it updates.`
+              }
+            />
+          </PanelSectionRow>
+          <InstallProgress install={install} />
+          {!installing && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" disabled={busy !== ""} onClick={() => onInstall(true)}>
+                {install?.state === "error" && install.mode === "update" ? "Try again" : "Update Lumux"}
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
+        </PanelSection>
+      )}
+
+      {(showInstall || (daemon && !paired)) && (
         <PanelSection title="Setup">
-          {status?.service === "missing" ? (
+          {showInstall ? (
             <>
               <PanelSectionRow>
                 <Field
-                  label="Lumux Flatpak not found"
-                  description="Install lumux.flatpak from the latest release once (Desktop Mode or SSH). Pairing the bridge happens right here afterwards."
+                  label={lumux?.system != null ? "Install Lumux for this user" : "Lumux isn't installed yet"}
+                  description={
+                    `Downloads Lumux ${lumux?.pinned ?? ""} from GitHub, plus the GNOME runtime from Flathub ` +
+                    "the first time (a few hundred MB, several minutes). Needs an internet connection."
+                  }
                 />
               </PanelSectionRow>
-              <PanelSectionRow>
-                <ButtonItem
-                  layout="below"
-                  disabled={busy !== ""}
-                  onClick={() => run("restart", () => restartService())}
-                >
-                  {busy === "restart" ? "Checking…" : "Check again"}
-                </ButtonItem>
-              </PanelSectionRow>
+              {lumux?.system != null && (
+                <PanelSectionRow>
+                  <div style={{ fontSize: "12px", opacity: 0.8 }}>
+                    {`Lumux ${lumux.system} is also installed system-wide (for example from Discover). ` +
+                      "It is left as it is; the plugin uses the copy it installs for you. You can remove " +
+                      "the system-wide one in Desktop Mode if you don't need it."}
+                  </div>
+                </PanelSectionRow>
+              )}
+              <InstallProgress install={install} />
+              {!installing && (
+                <PanelSectionRow>
+                  <ButtonItem layout="below" disabled={busy !== ""} onClick={() => onInstall(false)}>
+                    {install?.state === "error" && install.mode === "install" ? "Try again" : "Install Lumux"}
+                  </ButtonItem>
+                </PanelSectionRow>
+              )}
+              {!installing && (
+                <PanelSectionRow>
+                  <ButtonItem
+                    layout="below"
+                    disabled={busy !== ""}
+                    onClick={() => run("restart", () => restartService())}
+                  >
+                    {busy === "restart" ? "Checking…" : "Check again"}
+                  </ButtonItem>
+                </PanelSectionRow>
+              )}
             </>
           ) : (
             <PanelSectionRow>
@@ -380,6 +497,20 @@ function Content() {
             Restart Lumux service
           </ButtonItem>
         </PanelSectionRow>
+        {lumux && (
+          <PanelSectionRow>
+            <Field
+              label="Lumux Flatpak"
+              description={
+                (lumux.user != null ? `${lumux.user || "installed"} (user)` : "not installed for this user") +
+                (lumux.system != null
+                  ? ` • ${lumux.system || "installed"} system-wide${lumux.user != null ? " (not used)" : ""}`
+                  : "") +
+                ` • plugin is made for ${lumux.pinned}`
+              }
+            />
+          </PanelSectionRow>
+        )}
       </PanelSection>
     </>
   );

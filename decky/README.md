@@ -10,38 +10,49 @@ Quick Access menu. A thin [Decky Loader](https://decky.xyz) front-end for
 - Brightness slider
 - Status and errors (bridge, streaming, capture)
 - Pair with the bridge from Game Mode (link button)
+- Install and update Lumux itself from Game Mode
+
+Once Decky Loader is installed, setup is done entirely in Game Mode.
 
 ## Requirements
 
-- SteamOS 3.x (Game Mode) with Decky Loader
-- The **Lumux Flatpak** from the sjredondo/lumux releases, **v0.8.0 or newer** (the
-  first release that contains `lumux-daemon`)
+- SteamOS 3.x (Game Mode) with [Decky Loader](https://decky.xyz)
+- An internet connection for the first setup
 - A Hue bridge with an **entertainment area** (create it in the Hue app)
 
-## First-time setup
+The plugin runs the **Lumux Flatpak** (`io.github.enginkirmaci.lumux`). If it's
+missing, the plugin installs it for you (see below).
 
-1. In **Desktop Mode**, open Konsole and install or update the Lumux Flatpak:
+## First-time setup (all in Game Mode)
 
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/sjredondo/lumux/main/scripts/install-steamos.sh | bash
+1. **Install the plugin.** Decky (plug icon) → ⚙ Settings → **Developer** → enable
+   **Developer mode** if needed → **Install Plugin from URL** and enter
+
+   ```
+   https://github.com/sjredondo/lumux/releases/latest/download/decky-lumux.zip
    ```
 
-2. Pair the bridge. Either:
-   - open Lumux in Desktop Mode, run the bridge wizard and pick your entertainment
-     area (the plugin reads the same settings), or
-   - in Game Mode, open the plugin, press the bridge's link button and select
-     **Pair with Hue bridge** within 30 seconds.
-3. Install this plugin (see below), open the Quick Access menu (`…` button) → Lumux,
-   pick the entertainment area and switch **Sync lights** on.
+   (**Install Plugin from ZIP File** works too, with the zip from the
+   [latest release](https://github.com/sjredondo/lumux/releases/latest).)
+2. **Install Lumux.** Open the Quick Access menu (`…` button) → decky-lumux →
+   **Install Lumux**. The plugin downloads `lumux.flatpak` from the GitHub release that
+   matches the plugin, and Flatpak pulls the GNOME runtime from Flathub. The first time
+   that's a few hundred MB, so it can take several minutes. The panel shows progress.
+   You can close the menu and come back; the install keeps going.
+3. **Pair.** Press the link button on the Hue bridge, then select **Pair with Hue bridge**
+   within 30 seconds.
+4. Pick the entertainment area and switch **Sync lights** on.
 
-## Installing (sideload)
+If you already use Lumux in Desktop Mode, the plugin picks up that pairing and area
+(both share the same `settings.json`), and step 3 is skipped.
 
-1. Download `decky-lumux.zip` from the
-   [latest release](https://github.com/sjredondo/lumux/releases/latest).
-2. In Game Mode: Decky (plug icon) → ⚙ Settings → **Developer** → enable
-   **Developer mode** if needed.
-3. Use **Install Plugin from ZIP File** and pick the zip (for example from
-   `~/Downloads`), or **Install Plugin from URL** with the release asset URL.
+## Updating
+
+Each plugin build belongs to one Lumux release. When the installed Flatpak is older,
+the panel shows **Update Lumux**. It reinstalls the Flatpak from the matching release
+and restarts the service; if the lights were syncing, they resume afterwards.
+
+To update the plugin itself, install `decky-lumux.zip` from the URL again.
 
 ## How it works
 
@@ -58,7 +69,20 @@ flatpak run --command=lumux-daemon io.github.enginkirmaci.lumux --backend gamesc
   read-only SteamOS image doesn't ship the GStreamer PipeWire plugin, so the
   daemon can't run inside Decky or on the stock host Python. The Flatpak bundles
   everything it needs and lives in `/home`, so it survives SteamOS updates.
-- The plugin needs no `root` flag and ships no binaries.
+- The plugin needs no `root` flag and ships no binaries. **Install Lumux** runs, as the
+  Deck user:
+
+  ```
+  flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+  flatpak install --user -y --noninteractive [--reinstall] lumux.flatpak
+  ```
+
+  with `lumux.flatpak` downloaded from the release tagged `v<Lumux version>` (set in
+  `py_modules/lumux_decky/_version.py`). The latest release is used only if that tag
+  has no bundle. The lookup uses the GitHub API without a token (60 requests/hour).
+- If Lumux is also installed system-wide (for example the Flathub build from Discover),
+  the plugin leaves it alone, installs its own copy for the user and runs that one
+  (`flatpak run --user`).
 - In Game Mode, gamescope publishes the composited screen as a PipeWire video
   node named `gamescope`. The daemon reads it directly with `pipewiresrc`, with no
   screen-share portal or consent dialog. GStreamer shrinks each frame to about
@@ -88,7 +112,12 @@ The runner can also be changed in
   flatpak run --command=lumux-daemon io.github.enginkirmaci.lumux --ctl list_nodes
   ```
 
-- "This Lumux Flatpak has no lumux-daemon": update the Flatpak (step 1 above).
+- "This Lumux Flatpak has no lumux-daemon": select **Update Lumux** in the panel.
+- **Install Lumux** fails: the panel shows flatpak's error. Typical causes are no
+  network (check Wi-Fi, then **Try again**), too little storage, or a GitHub rate limit
+  (wait a few minutes). The full flatpak output is in `plugin.log`.
+- Installing by hand still works (Desktop Mode or SSH), e.g. with
+  `scripts/install-steamos.sh`; then select **Check again** in the panel.
 - Lights don't follow the screen but status says *Syncing*: run `--ctl list_nodes`.
   If gamescope's node isn't listed, PipeWire isn't letting the Flatpak see it;
   please open an issue with the output and `daemon.log`.

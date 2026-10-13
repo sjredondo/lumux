@@ -24,7 +24,8 @@ Real-time ambient lighting synchronization for Philips Hue lights on Linux (Wayl
 
 ### SteamOS / Steam Deck (this fork)
 
-In Desktop Mode, open Konsole and run:
+For Game Mode you can skip this section: the Decky plugin (next section) installs
+Lumux for you. For the desktop app in Desktop Mode, open Konsole and run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sjredondo/lumux/main/scripts/install-steamos.sh | bash
@@ -50,14 +51,19 @@ In Game Mode, sync is controlled from the Quick Access menu by the **Lumux Decky
 plugin** in [`decky/`](decky/). It starts a headless `lumux-daemon` from the Lumux
 Flatpak, which reads gamescope's screen straight from PipeWire (no consent dialog).
 
-1. Install [Decky Loader](https://decky.xyz) and the Lumux Flatpak (above, v0.8.0+).
-2. Pair the bridge, either in the Lumux desktop app in Desktop Mode or later from the
-   plugin with the bridge's link button.
-3. Download `decky-lumux.zip` from the
-   [latest release](https://github.com/sjredondo/lumux/releases/latest).
-4. In Game Mode: Decky → ⚙ Settings → Developer → enable Developer mode →
-   **Install Plugin from ZIP File** (or **from URL** with the asset link).
-5. Quick Access (`…`) → Lumux → pick the entertainment area → **Sync lights**.
+Setup is done entirely in Game Mode:
+
+1. With [Decky Loader](https://decky.xyz) installed: Decky → ⚙ Settings → Developer →
+   enable Developer mode → **Install Plugin from URL** →
+   `https://github.com/sjredondo/lumux/releases/latest/download/decky-lumux.zip`
+2. Quick Access (`…`) → decky-lumux → **Install Lumux**. This downloads the matching
+   `lumux.flatpak` release plus the GNOME runtime from Flathub, which takes a few
+   minutes the first time.
+3. Press the bridge's link button → **Pair with Hue bridge**.
+4. Pick the entertainment area → **Sync lights**.
+
+When a newer plugin needs a newer Lumux, the panel offers **Update Lumux**. If you
+already paired in the desktop app, the plugin uses that pairing.
 
 More detail, logs and troubleshooting: [decky/README.md](decky/README.md).
 
@@ -249,10 +255,12 @@ self-contained (it never imports from the rest of this repo). To submit:
 1. Split it into its own repository with history:
    `git subtree split --prefix=decky -b decky-plugin` and push that branch to a new
    repo, e.g. `sjredondo/decky-lumux`. Nothing inside `decky/` has to change.
-2. Bump `version` in `decky/package.json`; check `plugin.json` (`name`, `author`,
+2. Bump `version` in `decky/package.json` (and keep
+   `decky/py_modules/lumux_decky/_version.py` equal to the Lumux version; the tests
+   check it); check `plugin.json` (`name`, `author`,
    `publish.tags`, `publish.description`, `publish.image`). `flags` stays empty (no root).
-3. Make sure a Lumux Flatpak release with `lumux-daemon` is published, since the plugin
-   depends on it.
+3. Make sure the Lumux release named in `_version.py` is published with
+   `lumux.flatpak`, since **Install Lumux** downloads it.
 4. Test on the **Stable and Beta** SteamOS channels (Python backend, no custom binaries, so
    the Preview channel isn't required).
 5. Fork [decky-plugin-database](https://github.com/SteamDeckHomebrew/decky-plugin-database),

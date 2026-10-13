@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.8.5" date="2026-10-13">
+      <description>
+        <ul>
+          <li>decky-lumux: Install Lumux from Game Mode. The plugin downloads the matching lumux.flatpak release and its GNOME runtime, with progress in the panel, so no Desktop Mode step is needed</li>
+          <li>decky-lumux: Update Lumux button when the installed Flatpak is older than the plugin</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.4" date="2026-10-13">
       <description>
         <ul>
