@@ -43,8 +43,10 @@ class Plugin:
         """Service state plus the daemon's own status. Starts the daemon in
         the background the first time the panel asks."""
         sup = self.supervisor
-        # Also retry while "missing": the Flatpak may have just been installed
-        if sup.state in ("stopped", "missing") and not sup._start_lock.locked():
+        # Also retry while "missing": the Flatpak may have just been installed.
+        # Not while installing: the installer restarts the daemon when done.
+        if (sup.state in ("stopped", "missing") and not sup._start_lock.locked()
+                and not sup.installer.busy):
             asyncio.ensure_future(sup.ensure_running())
         daemon = None
         if sup.state in ("running", "starting"):
@@ -66,6 +68,8 @@ class Plugin:
             "daemon": daemon,
             "help_url": PAIRING_HELP_URL,
             "version": decky.DECKY_PLUGIN_VERSION,
+            "lumux": sup.lumux_info(),
+            "install": sup.installer.snapshot(),
         }
 
     async def set_sync(self, enabled: bool) -> dict:
@@ -112,6 +116,14 @@ class Plugin:
         ok = await self.supervisor.restart()
         return _ok(True) if ok else _err(self.supervisor.error or "could not start lumux-daemon")
 
+    async def install_lumux(self, update: bool = False) -> dict:
+        """Download and install (update=True: reinstall) the Lumux Flatpak
+        in the background; get_status()["install"] reports progress. A
+        second click while one runs just returns its progress."""
+        installer = self.supervisor.installer
+        started = installer.start(update=bool(update))
+        return _ok({"started": started, **installer.snapshot()})
+
     async def get_log(self, lines: int = 40) -> dict:
         return _ok(self.supervisor.log_tail(int(lines)))
 
@@ -131,6 +143,7 @@ class Plugin:
     async def _unload(self):
         # Stop syncing and release the entertainment area on the bridge
         if self.supervisor is not None:
+            await self.supervisor.installer.cancel()
             await self.supervisor.stop()
         decky.logger.info("Lumux plugin unloaded")
 

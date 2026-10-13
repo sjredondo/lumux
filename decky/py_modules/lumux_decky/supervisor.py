@@ -8,8 +8,11 @@ pipewiresrc, numpy, requests), lives in /home so it survives SteamOS
 updates, and is where the user pairs the bridge in Desktop Mode. So the
 default runner is ``flatpak run --command=lumux-daemon``.
 
+When the Flatpak is missing or older than this plugin, the panel installs
+or updates it from the matching GitHub release (installer.py).
+
 Runners, in "auto" order:
-  flatpak  the Lumux Flatpak (user or system install)
+  flatpak  the Lumux Flatpak (user install preferred, else system)
   host     a ``lumux-daemon`` on PATH or in ~/.local/bin
   custom   any command line from the plugin settings
 """
@@ -17,13 +20,16 @@ Runners, in "auto" order:
 import asyncio
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import client
+from ._version import LUMUX_VERSION
+from .installer import Installer, is_older
 
 FLATPAK_APP_ID = client.APP_ID
 RUNNERS = ("auto", "flatpak", "host", "custom")
@@ -127,6 +133,13 @@ class Supervisor:
         self._flatpak_cache: Optional[bool] = None
         self._flatpak_checked_at = 0.0
         self._flatpak_last_detail = ""
+        # Per installation: None = not installed, "" = installed, version unknown
+        self.flatpak_versions: Dict[str, Optional[str]] = {"user": None, "system": None}
+        self._resume_sync = False
+        self.installer = Installer(
+            env=self._env, which=self._which, logger=logger,
+            before_install=self._before_install, after_install=self._after_install,
+        )
 
     # -- settings ---------------------------------------------------------
 
@@ -178,20 +191,17 @@ class Supervisor:
                 return False
         env = self._env()
         flatpak = self._which("flatpak", path=env["PATH"])
-        ok = False
+        versions: Dict[str, Optional[str]] = {"user": None, "system": None}
         detail = "flatpak command not found"
         if flatpak:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    flatpak, "info", "--show-ref", FLATPAK_APP_ID,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                out, err = await asyncio.wait_for(proc.communicate(), 15)
-                ok = proc.returncode == 0
-                detail = (err or out or b"").decode(errors="replace").strip()
-            except (OSError, asyncio.TimeoutError) as e:
-                detail = f"{type(e).__name__}: {e}"
+            details = []
+            for where in ("user", "system"):
+                version, why = await self._flatpak_info(flatpak, env, where)
+                versions[where] = version
+                if why:
+                    details.append(why)
+            detail = details[-1] if details else ""
+        ok = any(v is not None for v in versions.values())
         if not ok and detail != self._flatpak_last_detail:
             # Logged once per distinct reason, with what flatpak looked at
             self._log(
@@ -201,9 +211,55 @@ class Supervisor:
                 f"XDG_DATA_HOME={env.get('XDG_DATA_HOME', '')}",
             )
         self._flatpak_last_detail = "" if ok else detail
+        self.flatpak_versions = versions
         self._flatpak_cache = ok
         self._flatpak_checked_at = time.monotonic()
         return ok
+
+    async def _flatpak_info(self, flatpak: str, env: Dict[str, str],
+                            where: str) -> Tuple[Optional[str], str]:
+        """(version, error detail) of the app in one installation; version
+        None if it isn't installed there, "" if flatpak shows none."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                flatpak, "info", f"--{where}", FLATPAK_APP_ID,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={**env, "LC_ALL": "C"},  # untranslated "Version:" label
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), 15)
+        except (OSError, asyncio.TimeoutError) as e:
+            return None, f"{type(e).__name__}: {e}"
+        text = (out or b"").decode(errors="replace")
+        if proc.returncode != 0:
+            return None, ((err or out or b"").decode(errors="replace").strip())
+        m = re.search(r"^\s*Version:\s*(\S+)", text, re.MULTILINE)
+        return (m.group(1) if m else ""), ""
+
+    def lumux_info(self) -> dict:
+        """What the panel needs to offer Install / Update Lumux."""
+        user, system = self.flatpak_versions["user"], self.flatpak_versions["system"]
+        return {
+            "pinned": LUMUX_VERSION,
+            "user": user,
+            "system": system,
+            "action": self.install_action(),
+        }
+
+    def install_action(self) -> str:
+        """"install", "update" or "" (nothing to offer)."""
+        if self._flatpak_cache is None:
+            return ""  # not checked yet
+        if self.settings["runner"] in ("host", "custom") or self.runner in ("host", "custom", "external"):
+            return ""  # the user runs the daemon some other way
+        no_daemon = self.state == "crashed" and "has no lumux-daemon" in self.error
+        user, system = self.flatpak_versions["user"], self.flatpak_versions["system"]
+        if user is not None:
+            return "update" if no_daemon or is_older(user, LUMUX_VERSION) else ""
+        if system is None:
+            return "install"
+        # Only a system-wide copy (e.g. from Flathub): add a user install
+        # next to it if that one can't run the plugin's daemon
+        return "install" if no_daemon or is_older(system, LUMUX_VERSION) else ""
 
     def host_daemon(self) -> Optional[str]:
         return self._which("lumux-daemon", path=self._env()["PATH"])
@@ -237,7 +293,9 @@ class Supervisor:
             daemon_args += ["--node", node]
         if runner == "flatpak":
             flatpak = self._which("flatpak", path=self._env()["PATH"]) or "flatpak"
-            return [flatpak, "run", "--command=lumux-daemon", FLATPAK_APP_ID, *daemon_args]
+            # With a system-wide copy as well, run ours (the one we install/update)
+            where = ["--user"] if self.flatpak_versions["user"] is not None else []
+            return [flatpak, "run", *where, "--command=lumux-daemon", FLATPAK_APP_ID, *daemon_args]
         if runner == "host":
             return [self.host_daemon() or "lumux-daemon", *daemon_args]
         if runner == "custom":
@@ -283,9 +341,8 @@ class Supervisor:
             self.state = "missing"
             self.runner = ""
             self.error = (
-                "The Lumux Flatpak (io.github.enginkirmaci.lumux) wasn't found. "
-                "Install lumux.flatpak from the latest release (one time, from "
-                "Desktop Mode or SSH); you can pair the bridge right here after."
+                "The Lumux Flatpak (io.github.enginkirmaci.lumux) isn't installed. "
+                "Select Install Lumux below; you can pair the bridge right here after."
             )
             if self._flatpak_last_detail:
                 self.error += f" [flatpak: {self._flatpak_last_detail[:160]}]"
@@ -374,8 +431,8 @@ class Supervisor:
     def _explain_exit(self, code: int, tail: str) -> str:
         if "lumux-daemon" in tail and ("not found" in tail or "No such file" in tail):
             return (
-                "This Lumux Flatpak has no lumux-daemon. Update it to the latest "
-                "sjredondo/lumux release (scripts/install-steamos.sh)."
+                "This Lumux Flatpak has no lumux-daemon. Select Update Lumux to "
+                f"install Lumux {LUMUX_VERSION}."
             )
         if "already running" in tail:
             return "another lumux-daemon is already using the control socket"
@@ -418,6 +475,34 @@ class Supervisor:
         self._crashes.clear()
         self._flatpak_cache = None
         return await self.ensure_running()
+
+    # -- install / update hooks (installer.py) --------------------------------
+
+    async def _before_install(self) -> None:
+        """Stop the daemon before flatpak replaces it; remember whether it
+        was syncing so an update doesn't switch the lights off."""
+        self._resume_sync = False
+        if self.proc is not None and self.proc.returncode is None:
+            try:
+                st = await client.request(self.sock, "status", timeout=3.0)
+                self._resume_sync = bool(st.get("syncing"))
+            except Exception:
+                pass
+        await self.stop()
+
+    async def _after_install(self, ok: bool) -> None:
+        """Re-detect the Flatpak and start the (new) daemon. Also runs after
+        a failed install, to bring the old daemon back."""
+        self._flatpak_cache = None
+        self._flatpak_last_detail = ""
+        started = await self.restart()
+        self._log("info", f"after install (ok={ok}): daemon started={started}, state={self.state}")
+        if started and self._resume_sync:
+            try:
+                await client.request(self.sock, "start", timeout=20.0)
+            except Exception as e:
+                self._log("warning", f"could not resume syncing: {e}")
+        self._resume_sync = False
 
     # -- helpers ----------------------------------------------------------
 
