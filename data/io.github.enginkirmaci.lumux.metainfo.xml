@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.8.7" date="2026-10-13">
+      <description>
+        <ul>
+          <li>Brightness is now the lights' own brightness: 100% = Hue's maximum whatever the screen shows, and the slider tunes it down; only near-black areas fade the lights out</li>
+          <li>Saturation 100% now lands exactly on the edge of Hue's colour range in every hue (computed in the lights' colour space)</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.6" date="2026-10-13">
       <description>
         <ul>

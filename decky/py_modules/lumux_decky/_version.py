@@ -9,5 +9,5 @@ the version in pyproject.toml: tests/test_decky_backend.py and the CI zip
 check fail otherwise. Use scripts/set-version.py to bump every copy at once.
 """
 
-LUMUX_VERSION = "0.8.6"
+LUMUX_VERSION = "0.8.7"
 GITHUB_REPO = "sjredondo/lumux"

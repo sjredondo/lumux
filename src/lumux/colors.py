@@ -1,30 +1,53 @@
 """Color analysis and conversion for Hue sync."""
 
-import colorsys
 from typing import Dict, Tuple, Optional
 
 from lumux.utils.rgb_xy_converter import rgb_to_xy
 
 
+# Hue "gamut C" (all current colour bulbs and strips): the most saturated
+# colours the lights can make. Screen RGB only spans the much smaller sRGB
+# triangle inside it, which is why "fully saturated" screen colours still
+# looked pale next to the Hue app.
+HUE_GAMUT_C = ((0.6915, 0.3083), (0.17, 0.7), (0.1532, 0.0475))
+WHITE_POINT = (0.3127, 0.3290)  # D65
+
+
+def _ray_to_gamut_edge(d: Tuple[float, float], gamut=HUE_GAMUT_C) -> float:
+    """t such that WHITE_POINT + t*d lies on the gamut triangle's edge."""
+    wx, wy = WHITE_POINT
+    best = float("inf")
+    for i in range(3):
+        (ax, ay), (bx, by) = gamut[i], gamut[(i + 1) % 3]
+        ex, ey = bx - ax, by - ay
+        denom = d[0] * ey - d[1] * ex
+        if abs(denom) < 1e-12:
+            continue
+        t = ((ax - wx) * ey - (ay - wy) * ex) / denom
+        u = ((ax - wx) * d[1] - (ay - wy) * d[0]) / denom
+        if t > 0 and -1e-9 <= u <= 1 + 1e-9:
+            best = min(best, t)
+    return best
+
+
 class ColorAnalyzer:
-    # Averaged screen edges are rarely near full white, so a 1:1 mapping left
-    # the lights dim. With this gain, brightness 100% (the slider maximum)
-    # drives a light to Hue's maximum (254) for any zone that is at least
-    # half-bright; lower settings scale that down proportionally.
-    BASE_BRIGHTNESS_GAIN = 2.0
-    # Below this HSV saturation a colour counts as neutral (white/grey/black
-    # UI); it is not forced towards a hue, which would make lights flicker
-    # between random colours on near-grey content.
-    NEUTRAL_SATURATION = 0.15
+    # Below this fraction of the way from white to the gamut edge a colour
+    # counts as neutral (white/grey UI). It is pushed proportionally less,
+    # so near-grey content doesn't make the lights flicker between hues.
+    NEUTRAL_CHROMA = 0.15
+    # Zones darker than this (black bars, loading screens) fade towards off
+    # instead of turning into full-brightness white.
+    BLACK_LEVEL = 0.08
 
     def __init__(
         self, brightness_scale: float = 1.0, gamma: float = 1.0, saturation: float = 1.0
     ):
-        # 0.0-1.0; 1.0 = Hue maximum
+        # 0.0-1.0 of the lights' own brightness: 1.0 = Hue's maximum. The
+        # screen picks the colour; this sets how bright the lights are.
         self.brightness_scale = brightness_scale
         self.gamma = gamma
-        # 0.0-1.0 vividness: 0 = colours as on screen, 1 = fully saturated
-        # (the most vivid colour the lights can show)
+        # 0.0-1.0: 0 = colours as on screen, 1 = the most saturated colour
+        # Hue lights can make in that hue (the edge of their gamut)
         self.saturation = saturation
         self.previous_colors: Dict[str, Tuple[Tuple[float, float], int]] = {}
 
@@ -40,49 +63,43 @@ class ColorAnalyzer:
         Returns:
             Tuple of ((x, y), brightness)
         """
-        corrected_rgb = self._apply_saturation(self._apply_gamma(rgb))
+        corrected_rgb = self._apply_gamma(rgb)
         r, g, b = corrected_rgb
-        xy = rgb_to_xy(r, g, b, light_info=light_info)
-
-        brightness = self._calculate_brightness(corrected_rgb)
-
+        xy = self._saturate_xy(rgb_to_xy(r, g, b, light_info=light_info))
+        brightness = self._calculate_brightness(max(corrected_rgb) / 255.0)
         return (xy, brightness)
 
-    def _calculate_brightness(self, rgb: Tuple[int, int, int]) -> int:
-        """Calculate brightness (0-254) from RGB.
+    def _calculate_brightness(self, level: float) -> int:
+        """Brightness (0-254) for a zone at ``level`` (max RGB component, 0-1).
 
-        Uses max RGB component to ensure uniform brightness across all colors.
-        This prevents blue and purple from appearing dimmer than other colors,
-        since the luminance formula heavily weights green (71.5%) while blue
-        only contributes 7.2%.
+        The brightness setting is the lights' brightness: 100% = Hue's
+        maximum for every zone with any colour, and lower settings tune it
+        down. Only near-black zones (below BLACK_LEVEL) fade towards off, so
+        black screens don't become bright white light.
         """
-        r, g, b = rgb
-        # Use max component for consistent brightness across all hues
-        max_component = max(r, g, b)
-        # Content brightness first (capped at Hue's maximum), *then* the
-        # user's setting: scaling before the cap meant 50% still gave full
-        # brightness on bright scenes, so the slider seemed to do nothing.
-        content = min(254.0, (max_component / 255.0) * 254.0 * self.BASE_BRIGHTNESS_GAIN)
         scale = max(0.0, min(1.0, self.brightness_scale))
-        return max(1, min(254, int(content * scale)))
+        fade = min(1.0, level / self.BLACK_LEVEL)
+        return max(1, min(254, int(254.0 * scale * fade)))
 
-    def _apply_saturation(self, rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
-        """Make colours more vivid, keeping their hue and brightness.
+    def _saturate_xy(self, xy: Tuple[float, float]) -> Tuple[float, float]:
+        """Push a colour from white towards Hue's gamut edge, keeping its hue.
 
-        Works in HSV: saturation is moved towards 1.0 by ``self.saturation``
-        (0 = unchanged, 1 = fully saturated, i.e. the purest colour the
-        lights can show). Value (brightness) is untouched. Near-neutral
-        colours get proportionally less push so grey/white stays calm.
+        Works in CIE xy, i.e. in the lights' own colour space: 100% is the
+        most saturated colour Hue can make in that hue (what the edge of the
+        Hue app's colour wheel gives), not just a saturated screen colour.
         """
         p = max(0.0, min(1.0, self.saturation))
-        r, g, b = rgb
-        if p <= 0.0 or r == g == b:
-            return rgb
-        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
-        weight = min(1.0, s / self.NEUTRAL_SATURATION)
-        s = s + (1.0 - s) * p * weight
-        r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
-        return (int(round(r2 * 255)), int(round(g2 * 255)), int(round(b2 * 255)))
+        d = (xy[0] - WHITE_POINT[0], xy[1] - WHITE_POINT[1])
+        if p <= 0.0 or (abs(d[0]) < 1e-6 and abs(d[1]) < 1e-6):
+            return xy
+        t_edge = _ray_to_gamut_edge(d)
+        if t_edge == float("inf"):
+            return xy
+        chroma = min(1.0, 1.0 / t_edge)  # 1.0 = on the gamut edge
+        weight = min(1.0, chroma / self.NEUTRAL_CHROMA)
+        target = chroma + (1.0 - chroma) * p * weight
+        f = target * t_edge
+        return (WHITE_POINT[0] + d[0] * f, WHITE_POINT[1] + d[1] * f)
 
     def _apply_gamma(self, rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Apply gamma correction to RGB values."""

@@ -1,55 +1,76 @@
-import colorsys
+import json
 
-from lumux.colors import ColorAnalyzer
+from lumux.colors import HUE_GAMUT_C, WHITE_POINT, ColorAnalyzer, _ray_to_gamut_edge
 from lumux.config.settings_manager import SettingsManager
+from lumux.utils.rgb_xy_converter import rgb_to_xy
 
 
-def _hsv(rgb):
-    return colorsys.rgb_to_hsv(*(c / 255.0 for c in rgb))
+def _chroma(xy):
+    """0 = white, 1 = on the edge of Hue's gamut, in that hue."""
+    d = (xy[0] - WHITE_POINT[0], xy[1] - WHITE_POINT[1])
+    return 1.0 / _ray_to_gamut_edge(d)
 
 
-def test_saturation_zero_leaves_colours_as_captured():
-    assert ColorAnalyzer(saturation=0.0)._apply_saturation((150, 120, 110)) == (150, 120, 110)
+def _hue_dir(xy):
+    d = (xy[0] - WHITE_POINT[0], xy[1] - WHITE_POINT[1])
+    n = (d[0] ** 2 + d[1] ** 2) ** 0.5
+    return (d[0] / n, d[1] / n)
 
 
-def test_saturation_full_is_the_most_vivid_colour():
-    """100% = fully saturated: same hue and brightness, no white mixed in."""
-    washed_out = (150, 120, 110)  # typical averaged screen edge
-    vivid = ColorAnalyzer(saturation=1.0)._apply_saturation(washed_out)
-    h0, s0, v0 = _hsv(washed_out)
-    h1, s1, v1 = _hsv(vivid)
-    assert s1 > 0.99 and min(vivid) == 0
-    assert abs(h1 - h0) < 0.01 and abs(v1 - v0) < 0.01  # hue + brightness kept
+WASHED_OUT = (150, 120, 110)  # typical averaged screen edge
 
 
-def test_saturation_scales_between_as_captured_and_full():
-    s = [_hsv(ColorAnalyzer(saturation=p)._apply_saturation((150, 120, 110)))[1]
+def test_averaged_screen_colours_sit_well_inside_hue_gamut():
+    """Averaged screen edges are pale, so the boost has to do the work."""
+    assert _chroma(rgb_to_xy(*WASHED_OUT)) < 0.3
+
+
+def test_saturation_zero_keeps_screen_colour():
+    xy, _ = ColorAnalyzer(saturation=0.0).analyze_zone(WASHED_OUT)
+    assert xy == rgb_to_xy(*WASHED_OUT)
+
+
+def test_saturation_full_reaches_hue_gamut_edge_in_the_same_hue():
+    for rgb in (WASHED_OUT, (0, 255, 0), (40, 60, 200), (255, 0, 0)):
+        xy, _ = ColorAnalyzer(saturation=1.0).analyze_zone(rgb)
+        assert abs(_chroma(xy) - 1.0) < 1e-6, rgb
+        a, b = _hue_dir(xy), _hue_dir(rgb_to_xy(*rgb))
+        assert a[0] * b[0] + a[1] * b[1] > 0.9999, rgb  # same hue
+
+
+def test_saturation_is_monotonic():
+    c = [_chroma(ColorAnalyzer(saturation=p).analyze_zone(WASHED_OUT)[0])
          for p in (0.0, 0.5, 1.0)]
-    assert s[0] < s[1] < s[2]
+    assert c[0] < c[1] < c[2]
 
 
-def test_saturation_keeps_neutrals_calm():
-    analyzer = ColorAnalyzer(saturation=1.0)
-    assert analyzer._apply_saturation((128, 128, 128)) == (128, 128, 128)
-    # a barely tinted grey isn't forced into a strong colour
-    assert _hsv(analyzer._apply_saturation((130, 128, 127)))[1] < 0.5
+def test_neutrals_stay_calm():
+    grey, _ = ColorAnalyzer(saturation=1.0).analyze_zone((128, 128, 128))
+    assert _chroma(grey) < 0.01
+    tinted, _ = ColorAnalyzer(saturation=1.0).analyze_zone((130, 128, 127))
+    assert _chroma(tinted) < 0.5
 
 
-def test_brightness_full_reaches_hue_maximum():
-    """100% (the maximum) drives the light to Hue's maximum 254 for any
-    zone at least half-bright; lower settings scale down proportionally."""
-    analyzer = ColorAnalyzer(brightness_scale=1.0)
-    assert analyzer._calculate_brightness((128, 64, 0)) == 254
-    assert analyzer._calculate_brightness((255, 255, 255)) == 254
-    assert analyzer._calculate_brightness((64, 32, 0)) == 127
-    assert ColorAnalyzer(brightness_scale=0.5)._calculate_brightness((255, 0, 0)) == 127
-    # values above 100% from older settings don't go beyond the maximum curve
-    assert ColorAnalyzer(brightness_scale=2.0)._calculate_brightness((64, 32, 0)) == 127
+def test_brightness_100_is_the_lights_maximum_whatever_the_screen():
+    """The slider is the lights' brightness: the screen only picks the colour."""
+    out = ColorAnalyzer(brightness_scale=1.0).analyze_zones_batch(
+        {"bright": (255, 200, 0), "dim": (64, 32, 0), "dark": (25, 10, 5)})
+    assert out["bright"][1] == out["dim"][1] == out["dark"][1] == 254
+
+
+def test_brightness_setting_tunes_the_lights_down():
+    for scale, expected in ((0.5, 127), (0.25, 63)):
+        out = ColorAnalyzer(brightness_scale=scale).analyze_zones_batch({"a": (64, 32, 0)})
+        assert out["a"][1] == expected
+
+
+def test_black_fades_out_instead_of_turning_white():
+    out = ColorAnalyzer().analyze_zones_batch({"black": (0, 0, 0), "near": (10, 5, 0)})
+    assert out["black"][1] == 1
+    assert 100 < out["near"][1] < 140  # ~4% level, half of the black threshold
 
 
 def test_old_settings_above_100_percent_are_capped(tmp_path, monkeypatch):
-    import json
-
     monkeypatch.setenv("LUMUX_CONFIG_DIR", str(tmp_path))
     (tmp_path / "settings.json").write_text(
         json.dumps({"sync": {"brightness_scale": 2.0, "saturation": 3.0}}))
@@ -59,3 +80,7 @@ def test_old_settings_above_100_percent_are_capped(tmp_path, monkeypatch):
         assert sync.brightness_scale == 1.0 and sync.saturation == 1.0
     finally:
         SettingsManager._instance = None
+
+
+def test_gamut_constant_is_hue_gamut_c():
+    assert HUE_GAMUT_C[1] == (0.17, 0.7)
