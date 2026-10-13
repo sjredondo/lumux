@@ -125,6 +125,9 @@ class EntertainmentStream:
         self._message_buffer: bytearray = bytearray()
         # Latest frame to transmit (rebuilt by send_colors*, read by sender)
         self._pending_message: Optional[bytes] = None
+        # Last colours per channel, re-applied over REST when sync stops so
+        # the lights stay as they were instead of reverting (often to off)
+        self._last_channel_colors: Dict[int, Tuple[Tuple[float, float], int]] = {}
 
     @property
     def channels(self) -> Dict[int, ChannelInfo]:
@@ -399,13 +402,22 @@ class EntertainmentStream:
         if rid:
             self._light_to_channel[rid] = channel_id
 
-    def disconnect(self, bridge: "HueBridge") -> None:
+    def disconnect(
+        self, bridge: "HueBridge", keep_colors: bool = False, wait: bool = False
+    ) -> None:
         """Stop the sender, close DTLS, and deactivate streaming.
 
-        Deactivating hands the lights back to the bridge, which restores
-        their pre-stream state.
+        Deactivating hands the lights back to the bridge, which restores their
+        pre-stream state - which is "off" if they were off before syncing.
+        With ``keep_colors`` the area's lights are then set to the last synced
+        colours, so stopping sync just stops syncing. That runs on a worker
+        thread unless ``wait`` (used at shutdown).
         """
         was_active = self._active
+        # If another app took the area over, it's theirs now: don't stop
+        # their stream or repaint their lights.
+        taken_over = self.last_error == self.TAKEOVER_ERROR
+        last_colors = dict(self._last_channel_colors)
         self._active = False
         self._stop_event.set()
         if self._sender and self._sender is not threading.current_thread():
@@ -413,9 +425,50 @@ class EntertainmentStream:
         self._sender = None
         self._close_transport(notify=True)
         self._pending_message = None
-        if was_active:
+        if was_active and not taken_over:
             self._deactivate_streaming(bridge)
+            if keep_colors and last_colors:
+                if wait:
+                    self._restore_last_colors(bridge, last_colors)
+                else:
+                    threading.Thread(
+                        target=self._restore_last_colors,
+                        args=(bridge, last_colors),
+                        daemon=True,
+                        name="HueKeepColors",
+                    ).start()
+        self._last_channel_colors = {}
         timed_print("Entertainment stream disconnected")
+
+    # Below this brightness a light is effectively off; let the bridge decide
+    KEEP_MIN_BRIGHTNESS = 3
+
+    def _restore_last_colors(
+        self, bridge: "HueBridge", channel_colors: Dict[int, Tuple[Tuple[float, float], int]]
+    ) -> None:
+        """Set each area light to its last streamed colour via REST."""
+        try:
+            time.sleep(0.5)  # let the bridge finish restoring its saved state
+            channel_lights = bridge.get_entertainment_channel_lights(
+                self.entertainment_config_id
+            )
+            per_light: Dict[str, list] = {}
+            for channel_id, ((x, y), bri) in channel_colors.items():
+                for light_id in channel_lights.get(channel_id, []):
+                    per_light.setdefault(light_id, []).append((x, y, bri))
+            kept = 0
+            for light_id, values in per_light.items():
+                n = len(values)  # gradient lights span several channels
+                x = sum(v[0] for v in values) / n
+                y = sum(v[1] for v in values) / n
+                bri = int(sum(v[2] for v in values) / n)
+                if bri < self.KEEP_MIN_BRIGHTNESS:
+                    continue
+                bridge.set_light_color(light_id, (x, y), bri, transition_time=300)
+                kept += 1
+            timed_print(f"Kept last synced colours on {kept} light(s)")
+        except Exception as e:
+            print(f"Could not keep last colours: {e}")
 
     def is_active(self) -> bool:
         """True between connect() and disconnect(), even while reconnecting."""
@@ -454,6 +507,8 @@ class EntertainmentStream:
         """
         if not self._message_buffer:
             return
+        if channel_colors:
+            self._last_channel_colors = dict(channel_colors)
         with self._lock:
             message = self._build_xy_message(channel_colors)
             self._sequence = (self._sequence + 1) % 256

@@ -33,6 +33,7 @@ interface DaemonStatus {
   area_id: string;
   streaming: boolean;
   brightness: number;
+  saturation?: number;
   capture: { backend: string; node: string; capturing: boolean; error: string };
   fps: number;
   last_error: string;
@@ -68,6 +69,7 @@ const setSync = callable<[enabled: boolean], Result<{ state: string }>>("set_syn
 const listAreas = callable<[], Result<{ areas: Area[]; selected: string }>>("list_areas");
 const selectArea = callable<[areaId: string], Result<unknown>>("select_area");
 const setBrightness = callable<[value: number], Result<unknown>>("set_brightness");
+const setSaturation = callable<[value: number], Result<unknown>>("set_saturation");
 const pair = callable<[bridgeIp: string], Result<{ bridge_ip: string; areas: Area[] }>>("pair");
 const listNodes = callable<[], Result<{ nodes: PwNode[]; gamescope: PwNode | null; selected: string }>>(
   "list_nodes",
@@ -124,6 +126,8 @@ function Content() {
   const [busy, setBusy] = useState("");
   const [actionError, setActionError] = useState("");
   const [brightness, setLocalBrightness] = useState<number | null>(null);
+  const [saturation, setLocalSaturation] = useState<number | null>(null);
+  const saturationTimer = useRef<number | undefined>(undefined);
   const [nodes, setNodes] = useState<PwNode[] | null>(null);
   const brightnessTimer = useRef<number | undefined>(undefined);
 
@@ -141,6 +145,7 @@ function Content() {
     return () => {
       window.clearInterval(timer);
       window.clearTimeout(brightnessTimer.current);
+      window.clearTimeout(saturationTimer.current);
     };
   }, [refresh]);
 
@@ -188,6 +193,17 @@ function Content() {
     }, 300);
   };
 
+  const onSaturation = (pct: number) => {
+    setLocalSaturation(pct);
+    window.clearTimeout(saturationTimer.current);
+    saturationTimer.current = window.setTimeout(() => {
+      setSaturation(pct / 100).then((res) => {
+        if (!res.ok) setActionError(res.error);
+        setLocalSaturation(null);
+      });
+    }, 300);
+  };
+
   const onPair = async () => {
     toaster.toast({ title: "Lumux", body: "Press the link button on your Hue bridge…" });
     const res = await run("pair", () => pair(""));
@@ -210,6 +226,7 @@ function Content() {
   const syncing = !!daemon && (daemon.syncing || daemon.state === "starting");
   const canSync = !!daemon && paired && !!daemon.area_id && busy === "";
   const pct = brightness ?? Math.round((daemon?.brightness ?? 1) * 100);
+  const satPct = saturation ?? Math.round((daemon?.saturation ?? 1) * 100);
   const problem =
     actionError ||
     (status?.service === "missing" || status?.service === "crashed" ? status.service_error : "") ||
@@ -257,6 +274,22 @@ function Content() {
               valueSuffix="%"
               resetValue={100}
               onChange={onBrightness}
+            />
+          </PanelSectionRow>
+        )}
+        {daemon && (
+          <PanelSectionRow>
+            <SliderField
+              label="Saturation"
+              description="Higher = more vivid colours"
+              value={satPct}
+              min={0}
+              max={300}
+              step={5}
+              showValue
+              valueSuffix="%"
+              resetValue={100}
+              onChange={onSaturation}
             />
           </PanelSectionRow>
         )}

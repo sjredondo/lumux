@@ -284,7 +284,7 @@ class ModeManager:
             return False
         return result
     
-    def turn_off(self, turn_off_lights: bool = True) -> bool:
+    def turn_off(self, turn_off_lights: bool = True, wait: bool = False) -> bool:
         """Turn off all lighting control.
         
         Args:
@@ -314,9 +314,13 @@ class ModeManager:
             timed_print("ModeManager: Auto-activated reading mode, staying in READING mode")
             return True
         
-        # Stop entertainment stream
+        # Stop entertainment stream. Unless lights are being switched off,
+        # leave them on their last synced colours instead of letting the
+        # bridge revert them (often to off).
         if self.entertainment_stream and self.entertainment_stream.is_active():
-            self.entertainment_stream.disconnect(self.bridge)
+            self.entertainment_stream.disconnect(
+                self.bridge, keep_colors=not turn_off_lights, wait=wait
+            )
         
         # Stop reading mode
         if self._reading_controller and self._reading_controller.is_active():

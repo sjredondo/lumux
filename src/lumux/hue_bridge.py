@@ -590,6 +590,41 @@ class HueBridge:
             print(f"Error resolving entertainment light IDs: {e}")
             return []
 
+    def get_entertainment_channel_lights(self, config_id: str) -> Dict[int, List[str]]:
+        """Map each entertainment channel to the light RIDs it drives.
+
+        Channels reference entertainment services; the device list links
+        those to the device's light service(s).
+        """
+        if not self.client or not config_id:
+            return {}
+        try:
+            config = self.client.get_entertainment_configuration(config_id)
+            if not config:
+                return {}
+            service_lights: Dict[str, List[str]] = {}
+            for device in self.client.get_devices():
+                services = device.get('services', [])
+                lights = [s.get('rid') for s in services if s.get('rtype') == 'light' and s.get('rid')]
+                for service in services:
+                    if service.get('rid'):
+                        service_lights[service['rid']] = lights
+            result: Dict[int, List[str]] = {}
+            for channel in config.get('channels', []):
+                channel_id = channel.get('channel_id')
+                if channel_id is None:
+                    continue
+                lights: List[str] = []
+                for member in channel.get('members', []):
+                    for lid in service_lights.get(member.get('service', {}).get('rid'), []):
+                        if lid not in lights:
+                            lights.append(lid)
+                result[channel_id] = lights
+            return result
+        except BridgeError as e:
+            print(f"Error mapping entertainment channels to lights: {e}")
+            return {}
+
     def activate_entertainment_streaming(self, config_id: str) -> bool:
         """Activate entertainment streaming for a configuration."""
         if not self.client:

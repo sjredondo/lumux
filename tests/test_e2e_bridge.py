@@ -183,3 +183,52 @@ def _wait(cond, timeout):
             return True
         time.sleep(0.1)
     return cond()
+
+
+def test_stopping_keeps_lights_on_last_colours(bridge_srv, hue):
+    """Stopping sync must not leave the area's lights off: the bridge restores
+    their pre-sync state (often off), so Lumux re-applies the last colours."""
+    from lumux.entertainment import EntertainmentStream
+
+    stream = _stream()
+    assert stream.connect(hue), stream.last_error
+    stream.send_colors_xy({0: ((0.6, 0.3), 200), 1: ((0.2, 0.1), 2)})
+    time.sleep(0.3)
+    stream.disconnect(hue, keep_colors=True, wait=True)
+    assert bridge_srv.stream_actions()[-1] == "stop"
+    puts = {p.rsplit("/", 1)[-1]: b for p, b in bridge_srv.puts if "/resource/light/" in p}
+    # channel 0 -> L1 kept on its colour; channel 1 was ~black -> left alone
+    assert set(puts) == {"L1"}
+    assert puts["L1"]["on"] == {"on": True}
+    assert abs(puts["L1"]["color"]["xy"]["x"] - 0.6) < 1e-6
+    # nothing was switched off
+    assert not any(b.get("on") == {"on": False} for _, b in bridge_srv.puts)
+
+
+def test_shutdown_never_switches_lights_off(bridge_srv, hue, monkeypatch):
+    from lumux.mode_manager import ModeManager, Mode
+    from lumux.reading_mode import ReadingModeController
+
+    reading = ReadingModeController(hue, fb.ENT_ID)
+    assert reading.activate(xy=(0.5, 0.4), brightness=120)
+
+    class _Sync:
+        def is_running(self):
+            return False
+
+    manager = ModeManager(hue, _Sync(), None, entertainment_config_id=fb.ENT_ID)
+    manager._reading_controller = reading
+    manager.current_mode = Mode.READING
+    bridge_srv.puts.clear()
+    manager.turn_off(turn_off_lights=False, wait=True)  # what shutdown does now
+    assert not any(b.get("on") == {"on": False} for _, b in bridge_srv.puts)
+
+
+def test_taken_over_area_is_left_alone_on_stop(bridge_srv, hue):
+    stream = _stream()
+    assert stream.connect(hue), stream.last_error
+    stream.send_colors_xy({0: ((0.6, 0.3), 200)})
+    stream.last_error = stream.TAKEOVER_ERROR  # someone else owns the area now
+    bridge_srv.puts.clear()
+    stream.disconnect(hue, keep_colors=True, wait=True)
+    assert bridge_srv.puts == []  # no "stop", no repainting their lights

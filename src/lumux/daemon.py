@@ -9,7 +9,8 @@ socket speaking JSON lines::
     <- {"id": 1, "ok": true, "result": {...}}
     <- {"id": 2, "ok": false, "error": "..."}
 
-Commands: ping, status, start, stop, set_brightness {value}, list_areas,
+Commands: ping, status, start, stop, set_brightness {value},
+set_saturation {value}, list_areas,
 select_area {area_id}, discover, pair {bridge_ip?, timeout?}, list_nodes,
 set_node {node}, shutdown.
 
@@ -233,6 +234,7 @@ class LumuxDaemon:
             "start": (self._cmd_start, True),
             "stop": (self._cmd_stop, True),
             "set_brightness": (self._cmd_set_brightness, True),
+            "set_saturation": (self._cmd_set_saturation, True),
             "list_areas": (self._cmd_list_areas, False),
             "select_area": (self._cmd_select_area, True),
             "discover": (self._cmd_discover, False),
@@ -396,6 +398,7 @@ class LumuxDaemon:
             "area_id": hue.entertainment_config_id,
             "streaming": bool(stream and stream.is_connected()),
             "brightness": self.settings.sync.brightness_scale,
+            "saturation": self.settings.sync.saturation,
             "capture": {
                 "backend": backend,
                 "node": capture.pipewire_node if backend == "gamescope" else "",
@@ -461,6 +464,18 @@ class LumuxDaemon:
         if args.get("save", True):
             self.settings.save()
         return {"brightness": value}
+
+    def _cmd_set_saturation(self, args: dict) -> dict:
+        try:
+            value = float(args["value"])
+        except (KeyError, TypeError, ValueError):
+            raise CommandError("set_saturation needs a numeric 'value' (0.0-3.0)")
+        value = max(0.0, min(3.0, value))
+        self.settings.sync.saturation = value
+        self.ctx.color_analyzer.saturation = value
+        if args.get("save", True):
+            self.settings.save()
+        return {"saturation": value}
 
     def _cmd_list_areas(self, args: dict) -> dict:
         if not (self.settings.hue.bridge_ip and self.settings.hue.app_key):

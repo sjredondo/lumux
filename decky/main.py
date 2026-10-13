@@ -75,6 +75,9 @@ class Plugin:
     async def set_brightness(self, value: float) -> dict:
         return await self._call("set_brightness", value=float(value))
 
+    async def set_saturation(self, value: float) -> dict:
+        return await self._call("set_saturation", value=float(value))
+
     async def pair(self, bridge_ip: str = "") -> dict:
         args = {"timeout": 30}
         if bridge_ip:

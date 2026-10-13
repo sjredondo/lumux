@@ -53,6 +53,8 @@ class SyncSettings:
     brightness_scale: float = 1.0
     gamma: float = 1.0
     smoothing_factor: float = 0.3
+    # Colour saturation boost: 1.0 = as captured, 2.0 = twice as vivid
+    saturation: float = 1.0
 
 
 @dataclass
@@ -257,6 +259,11 @@ class SettingsManager:
         ):
             self._settings.capture.pipewire_node = "gamescope"
         self._settings.sync.fps = max(1, min(60, self._settings.sync.fps))
+        try:
+            saturation = float(self._settings.sync.saturation)
+        except (TypeError, ValueError):
+            saturation = 1.0
+        self._settings.sync.saturation = max(0.0, min(3.0, saturation))
         self._settings.sync.transition_time_ms = max(
             0, min(1000, self._settings.sync.transition_time_ms)
         )

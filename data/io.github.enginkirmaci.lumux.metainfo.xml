@@ -77,6 +77,15 @@
   </branding>
 
   <releases>
+    <release version="0.8.2" date="2026-10-13">
+      <description>
+        <ul>
+          <li>Stopping sync (or quitting, or leaving Game Mode) no longer turns the lights off; they stay on their last synced colours</li>
+          <li>New Saturation slider (window and Decky panel) for more vivid colours</li>
+          <li>Brighter default: 100% brightness now equals the old 200%</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.1" date="2026-10-13">
       <description>
         <p>Screen capture fixes:</p>

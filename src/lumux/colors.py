@@ -6,9 +6,18 @@ from lumux.utils.rgb_xy_converter import rgb_to_xy
 
 
 class ColorAnalyzer:
-    def __init__(self, brightness_scale: float = 1.0, gamma: float = 1.0):
+    # Averaged screen edges are rarely near full white, so a 1:1 mapping left
+    # the lights dim. 100% on the brightness setting now means what 200% used
+    # to (anything at half intensity or above drives the light fully).
+    BASE_BRIGHTNESS_GAIN = 2.0
+
+    def __init__(
+        self, brightness_scale: float = 1.0, gamma: float = 1.0, saturation: float = 1.0
+    ):
         self.brightness_scale = brightness_scale
         self.gamma = gamma
+        # 1.0 = as captured; >1 makes colours more vivid, <1 more pastel
+        self.saturation = saturation
         self.previous_colors: Dict[str, Tuple[Tuple[float, float], int]] = {}
 
     def analyze_zone(
@@ -23,7 +32,7 @@ class ColorAnalyzer:
         Returns:
             Tuple of ((x, y), brightness)
         """
-        corrected_rgb = self._apply_gamma(rgb)
+        corrected_rgb = self._apply_saturation(self._apply_gamma(rgb))
         r, g, b = corrected_rgb
         xy = rgb_to_xy(r, g, b, light_info=light_info)
 
@@ -42,8 +51,25 @@ class ColorAnalyzer:
         r, g, b = rgb
         # Use max component for consistent brightness across all hues
         max_component = max(r, g, b)
-        brightness = int((max_component / 255.0) * 254.0 * self.brightness_scale)
+        brightness = int(
+            (max_component / 255.0) * 254.0 * self.BASE_BRIGHTNESS_GAIN * self.brightness_scale
+        )
         return max(1, min(254, brightness))
+
+    def _apply_saturation(self, rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        """Push each channel away from (or towards) the pixel's grey level.
+
+        Screen edges averaged over many pixels come out washed-out, so the
+        lights look pale; boosting saturation restores vivid colours.
+        """
+        s = self.saturation
+        if abs(s - 1.0) < 1e-3:
+            return rgb
+        r, g, b = rgb
+        grey = 0.299 * r + 0.587 * g + 0.114 * b
+        return tuple(  # type: ignore[return-value]
+            int(round(max(0.0, min(255.0, grey + (c - grey) * s)))) for c in (r, g, b)
+        )
 
     def _apply_gamma(self, rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Apply gamma correction to RGB values."""

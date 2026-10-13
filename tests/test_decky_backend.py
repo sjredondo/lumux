@@ -150,6 +150,8 @@ def test_plugin_drives_daemon(tmp_path, monkeypatch):
         assert not res["ok"] and "Not paired" in res["error"]
         res = await plugin.set_brightness(0.6)
         assert res["ok"] and res["result"]["brightness"] == 0.6
+        res = await plugin.set_saturation(1.5)
+        assert res["ok"] and res["result"]["saturation"] == 1.5
         res = await plugin.list_areas()
         assert not res["ok"]
         res = await plugin.set_node("gamescope-1")
